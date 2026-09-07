@@ -122,6 +122,20 @@ static bool new_window_closing_behavior = true;
 #endif
 static bool close_window;
 static bool full_video_reset = true;
+/* Set by video_reset(RESET_TYPE_RTP_SHUTDOWN) for a plain mirror reconnect
+ * (not HLS) to tell the main_loop post-loop block to leave the video
+ * pipeline alone rather than destroy+recreate it. Recreating the pipeline
+ * closes and reopens the v4l2h264dec hardware decoder's device node; on this
+ * hardware (RPi bcm2835-codec) that close/reopen cycle can leave the codec
+ * firmware wedged -- it keeps accepting compressed input via qbuf but never
+ * produces decoded output again, freezing video until the next full restart.
+ * Confirmed via the -capture/-replay harness: simulating a reconnect that
+ * recreates the pipeline reproduces the freeze (v4l2h264dec's output loop
+ * blocks forever in its first post-reopen acquire/dqbuf); simulating a
+ * reconnect that just resumes feeding the SAME live pipeline (with the fresh
+ * SPS/PPS a real reconnect also sends, matching raop_rtp_mirror.c's
+ * prepend_sps_pps behavior) decodes and renders normally. */
+static bool skip_video_rebuild = false;
 static std::string video_parser = "h264parse";
 static std::string video_decoder = "decodebin";
 static std::string video_converter = "videoconvert";
@@ -141,6 +155,199 @@ static int audio_dump_count = 0;
 static bool dump_audio = false;
 static unsigned char audio_type = 0x00;
 static unsigned char previous_audio_type = 0x00;
+
+/* --- capture/replay: record decrypted mirror A/V + flush events so a real
+ * session can be replayed e2e on the Pi (autonomous A/V-sync testing). --- */
+#include <time.h>
+static FILE *capture_fp = NULL;
+static pthread_mutex_t capture_mutex = PTHREAD_MUTEX_INITIALIZER;
+static std::string capture_filename;
+static bool do_capture = false;
+static std::string replay_filename;
+static bool do_replay = false;
+static uint64_t cap_mono_ns(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
+}
+/* record layout: [type:1][mono_ns:8][ntp:8][len:4][data:len]
+ * types: 'V' video frame, 'A' audio frame, 'C' ct header (ct in ntp field),
+ *        'v' video flush, 'a' audio flush */
+static void cap_write(char type, const unsigned char *data, int len, uint64_t ntp) {
+    if (!capture_fp) return;
+    uint64_t t = cap_mono_ns();
+    int l = (data && len > 0) ? len : 0;
+    /* audio_process and video_process run on separate threads and both call
+     * this; without a lock their fwrite() calls interleave at the byte level
+     * and corrupt the file (each record must be written atomically). A
+     * per-record fflush() here was also expensive enough (disk I/O ~100+
+     * times/sec on the Pi's SD card) to visibly lag live playback -- flush
+     * periodically instead, bounding data loss on a crash to a fraction of
+     * a second without stalling the hot path on every frame. */
+    pthread_mutex_lock(&capture_mutex);
+    fwrite(&type, 1, 1, capture_fp);
+    fwrite(&t, 8, 1, capture_fp);
+    fwrite(&ntp, 8, 1, capture_fp);
+    fwrite(&l, 4, 1, capture_fp);
+    if (l) fwrite(data, 1, l, capture_fp);
+    static int since_flush = 0;
+    if (++since_flush >= 50) { fflush(capture_fp); since_flush = 0; }
+    pthread_mutex_unlock(&capture_mutex);
+}
+
+/* Replay a captured session into the (already-initialised) renderers, honouring
+ * the original inter-frame arrival timing and flush events. Run with -vsync no
+ * so playback timing is set purely by this feed (captured ntp/base_time from a
+ * different session are irrelevant). Fully autonomous: no AirPlay/network.
+ * A GMainLoop (with the renderers' bus watches) runs in the main thread while a
+ * feeder thread pushes the recorded frames. */
+extern "C" void video_process (void *cls, raop_ntp_t *ntp, video_decode_struct *data);
+extern "C" void audio_process (void *cls, raop_ntp_t *ntp, audio_decode_struct *data);
+static GMainLoop *replay_loop = NULL;
+static uint64_t remote_clock_offset = 0;
+
+/* Simulate a live client disconnect+reconnect during replay, so the reconnect
+ * video lifecycle can be tested autonomously (the harness otherwise never
+ * exercises video_reset / pipeline teardown / kmssink DRM re-acquire).
+ *   UX_RECONNECT_AT_MS = replay-elapsed ms at which to fire one reconnect.
+ *   UX_RECONNECT_MODE  = "full" (default): what Linux main_loop does on
+ *                        reconnect (video_renderer_stop -> destroy -> init ->
+ *                        start), recreating the pipeline+kmssink; or
+ *                        "stop": keep the pipeline, just stop it and let
+ *                        choose_codec restart it (reuses the same kmssink).
+ * Both then run choose_codec + audio_renderer_start, as a fresh client does.
+ * Definition is below the option globals it needs; forward-declared here. */
+static void replay_do_reconnect(unsigned char ct);
+
+/* A real AirPlay reconnect (or seek/resume) always re-sends fresh SPS+PPS
+ * NALs, prepended by raop_rtp_mirror.c to the next VCL NAL (see its
+ * "prepend_sps_pps" logic) -- a decoder never has to cold-start on a bare
+ * mid-GOP frame. Captured .cap files only record the already-assembled
+ * elementary stream, so replaying raw bytes across a simulated reconnect
+ * would starve the fresh decoder of config it would have gotten live. Scrape
+ * the leading SPS(7)/PPS(8) NALs from the very first captured video frame
+ * (which, being the real connection start, already has them) and re-prepend
+ * them to the first frame fed after a simulated reconnect, mirroring what
+ * the real sender does. */
+static unsigned char g_sps_pps[4096];
+static int g_sps_pps_len = 0;
+static bool g_have_sps_pps = false;
+static bool g_prime_next_video_frame = false;
+static void extract_sps_pps(const unsigned char *data, int len) {
+    int i = 0, out = 0;
+    while (i + 4 < len && out < (int) sizeof(g_sps_pps)) {
+        int sc_len = 0;
+        if (data[i] == 0 && data[i+1] == 0 && data[i+2] == 1) sc_len = 3;
+        else if (data[i] == 0 && data[i+1] == 0 && data[i+2] == 0 && data[i+3] == 1) sc_len = 4;
+        else { i++; continue; }
+        int nal_start = i + sc_len;
+        if (nal_start >= len) break;
+        int nal_type = data[nal_start] & 0x1F;
+        if (nal_type != 7 && nal_type != 8) break; /* stop at first non-SPS/PPS NAL */
+        /* find next start code (or end of buffer) to get this NAL's extent */
+        int j = nal_start + 1;
+        while (j + 3 < len && !(data[j] == 0 && data[j+1] == 0 && (data[j+2] == 1 || (data[j+2] == 0 && data[j+3] == 1)))) j++;
+        if (j + 3 >= len) j = len;
+        int nal_total = j - i;
+        if (out + nal_total > (int) sizeof(g_sps_pps)) break;
+        memcpy(g_sps_pps + out, data + i, nal_total);
+        out += nal_total;
+        i = j;
+    }
+    g_sps_pps_len = out;
+    g_have_sps_pps = (out > 0);
+    fprintf(stderr, "replay: extracted %d bytes of SPS/PPS from first video frame for reconnect re-priming\n", out);
+}
+
+static gpointer replay_feeder(gpointer data) {
+    (void) data;
+    FILE *f = fopen(replay_filename.c_str(), "rb");
+    if (!f) { fprintf(stderr, "replay: cannot open %s\n", replay_filename.c_str()); if (replay_loop) g_main_loop_quit(replay_loop); return NULL; }
+    static unsigned char buf[1 << 21];
+    static unsigned char primed_buf[1 << 21];
+    uint64_t first_mono = 0, start_wall = 0, ntp_rebase = 0;
+    bool have_first = false;
+    bool have_first_video = false;
+    unsigned short seq = 0;
+    unsigned char ct_current = 8;
+    long vframes = 0, aframes = 0, flushes = 0;
+    const char *recon_env = g_getenv("UX_RECONNECT_AT_MS");
+    uint64_t reconnect_at_ns = recon_env ? (uint64_t) atoll(recon_env) * 1000000ULL : 0;
+    bool reconnect_done = false;
+    while (true) {
+        char type; uint64_t t, ntp; int len;
+        if (fread(&type, 1, 1, f) != 1) break;
+        if (fread(&t, 8, 1, f) != 1) break;
+        if (fread(&ntp, 8, 1, f) != 1) break;
+        if (fread(&len, 4, 1, f) != 1) break;
+        if (len > 0) { if (len > (int) sizeof(buf) || fread(buf, 1, len, f) != (size_t) len) break; }
+        if (!have_first) { first_mono = t; start_wall = cap_mono_ns(); have_first = true; }
+        if (reconnect_at_ns && !reconnect_done && (t - first_mono) >= reconnect_at_ns) {
+            replay_do_reconnect(ct_current);
+            reconnect_done = true;
+            g_prime_next_video_frame = true;
+        }
+        (void) ntp_rebase;
+        uint64_t target = start_wall + (t - first_mono);
+        /* optional: feed VIDEO a constant N ms late vs schedule (simulate network
+         * jitter so sync=true sees late frames — repro of the live freeze). */
+        if (type == 'V') { const char *jm = g_getenv("UX_VDELAY_MS"); if (jm) { long ms = atol(jm); if (ms > 0) target += (uint64_t) ms * 1000000ULL; } }
+        uint64_t now = cap_mono_ns();
+        if (target > now) {
+            uint64_t d = target - now;
+            struct timespec ts; ts.tv_sec = d / 1000000000ULL; ts.tv_nsec = d % 1000000000ULL;
+            nanosleep(&ts, NULL);
+        }
+        /* Feed through the real RAOP callbacks (video_process/audio_process) so the
+         * full live clock path runs: remote_clock_offset (maps the captured ntp to
+         * the current local clock) + the pts-mismatch loop. This makes the harness
+         * faithful for testing sync=true. */
+        switch (type) {
+        case 'C': { ct_current = (unsigned char) ntp; if (use_audio) audio_renderer_start(&ct_current); break; }
+        case 'A': {
+            audio_decode_struct ad; ad.data = buf; ad.ct = (unsigned char) ct_current; ad.data_len = len;
+            ad.sync_status = 0; ad.ntp_time_local = 0; ad.ntp_time_remote = ntp; ad.rtp_time = 0; ad.seqnum = seq++;
+            audio_process(NULL, NULL, &ad); aframes++; break; }
+        case 'V': {
+            if (!have_first_video) { extract_sps_pps(buf, len); have_first_video = true; }
+            unsigned char *vdata = buf;
+            int vlen = len;
+            if (g_prime_next_video_frame) {
+                g_prime_next_video_frame = false;
+                if (g_have_sps_pps && g_sps_pps_len + len <= (int) sizeof(primed_buf)) {
+                    memcpy(primed_buf, g_sps_pps, g_sps_pps_len);
+                    memcpy(primed_buf + g_sps_pps_len, buf, len);
+                    vdata = primed_buf;
+                    vlen = g_sps_pps_len + len;
+                    fprintf(stderr, "replay: re-primed post-reconnect frame with %d bytes of SPS/PPS\n", g_sps_pps_len);
+                }
+            }
+            video_decode_struct vd; vd.is_h265 = false; vd.nal_count = 0; vd.data = vdata; vd.data_len = vlen;
+            vd.ntp_time_local = 0; vd.ntp_time_remote = ntp;
+            video_process(NULL, NULL, &vd); vframes++; break; }
+        case 'a': { if (use_audio) audio_renderer_flush(); flushes++; break; }
+        case 'v': { if (use_video) video_renderer_flush(); flushes++; break; }
+        default: break;
+        }
+    }
+    fclose(f);
+    fprintf(stderr, "replay: done (%ld video, %ld audio frames, %ld flushes)\n", vframes, aframes, flushes);
+    sleep(3); /* let the pipeline drain so trailing AVMARKs are logged */
+    if (replay_loop) g_main_loop_quit(replay_loop);
+    return NULL;
+}
+static void replay_run(void) {
+    replay_loop = g_main_loop_new(NULL, FALSE);
+    if (use_video) video_renderer_listen((void *) replay_loop, 0);
+    if (use_audio) audio_renderer_listen((void *) replay_loop, 0);
+    /* Live, the RAOP video_set_codec callback selects the active (h264) renderer
+     * and moves its pipeline to PLAYING; replay has no such callback, so do it
+     * here (mirror is always h264 for our use). Without this, renderer stays NULL
+     * and the video pipeline is stuck async-to-PAUSED. */
+    if (use_video) video_renderer_choose_codec(false, false);
+    GThread *th = g_thread_new("replay-feeder", replay_feeder, NULL);
+    g_main_loop_run(replay_loop);
+    g_thread_join(th);
+}
 static bool fullscreen = false;
 static bool render_coverart = false;
 static std::string coverart_filename = "";
@@ -157,7 +364,6 @@ static int nohold = 0;
 static bool nofreeze = false;
 static unsigned short raop_port;
 static unsigned short airplay_port;
-static uint64_t remote_clock_offset = 0;
 static std::vector<std::string> allowed_clients;
 static std::vector<std::string> blocked_clients;
 static bool restrict_clients;
@@ -210,6 +416,61 @@ static std::string audio_rtp_pipeline = "";
 static GMainLoop *gmainloop = NULL;
 static bool mux_to_file = false;
 static std::string mux_filename = "recording";
+
+/* forward-declared above replay_feeder; see comment there.
+ * UX_RECONNECT_MODE: "full" (default, matches pre-fix live main_loop
+ * behavior) tears down and rebuilds the whole video pipeline (closes+reopens
+ * the v4l2h264dec hardware decoder's /dev/video10); "stop" only drops the
+ * pipeline to GST_STATE_NULL (still closes the device, since v4l2h264dec
+ * closes on READY->NULL) and lets choose_codec bring it back; "none" never
+ * touches the video pipeline's state at all, testing whether avoiding the
+ * device close/reopen cycle avoids the freeze; "real" calls the actual
+ * production video_reset(RESET_TYPE_RTP_SHUTDOWN) + replicates the
+ * post-main_loop skip_video_rebuild check, exercising the real fix. */
+extern "C" void video_reset(void *cls, reset_type_t type);
+static void replay_do_reconnect(unsigned char ct) {
+    const char *mode = g_getenv("UX_RECONNECT_MODE");
+    bool real = (mode && !strcmp(mode, "real"));
+    bool none = (mode && !strcmp(mode, "none"));
+    bool full = !real && !none && !(mode && !strcmp(mode, "stop"));
+    fprintf(stderr, "replay: ===== SIMULATING RECONNECT (mode=%s) =====\n", real ? "real" : (none ? "none" : (full ? "full" : "stop")));
+    if (real) {
+        /* Exercise the actual production reconnect path. */
+        video_reset(NULL, RESET_TYPE_RTP_SHUTDOWN);
+        if (use_audio) audio_renderer_stop();
+        if (use_video && !skip_video_rebuild) {
+            video_renderer_destroy();
+            video_renderer_init(render_logger, server_name.c_str(), videoflip, video_parser.c_str(), rtp_pipeline.c_str(),
+                                video_decoder.c_str(), video_converter.c_str(), videosink.c_str(),
+                                videosink_options.c_str(), fullscreen, video_sync, h265_support,
+                                render_coverart, playbin_version, NULL);
+            video_renderer_start();
+            video_renderer_listen((void *) replay_loop, 0);
+        }
+        if (use_audio) audio_renderer_start(&ct);
+        if (use_video) video_renderer_choose_codec(false, false);
+        fprintf(stderr, "replay: ===== RECONNECT DONE (skip_video_rebuild=%d) =====\n", (int) skip_video_rebuild);
+        return;
+    }
+    /* ---- disconnect: what video_reset(RESET_TYPE_RTP_SHUTDOWN) does ---- */
+    if (use_video && !none) video_renderer_stop();
+    remote_clock_offset = 0;
+    if (use_audio) audio_renderer_stop();
+    /* ---- main_loop reconnect block (Linux: close_window is always true) ---- */
+    if (full && use_video) {
+        video_renderer_destroy();
+        video_renderer_init(render_logger, server_name.c_str(), videoflip, video_parser.c_str(), rtp_pipeline.c_str(),
+                            video_decoder.c_str(), video_converter.c_str(), videosink.c_str(),
+                            videosink_options.c_str(), fullscreen, video_sync, h265_support,
+                            render_coverart, playbin_version, NULL);
+        video_renderer_start();
+        video_renderer_listen((void *) replay_loop, 0); /* re-arm bus watch on new pipeline */
+    }
+    /* ---- reconnect: new client SETUP -> video_set_codec + audio start ---- */
+    if (use_audio) audio_renderer_start(&ct);
+    if (use_video) video_renderer_choose_codec(false, false);
+    fprintf(stderr, "replay: ===== RECONNECT DONE =====\n");
+}
 
 //Support for D-Bus-based screensaver inhibition (org.freedesktop.ScreenSaver) 
 static unsigned int scrsv = 0;
@@ -702,6 +963,7 @@ static void main_loop()  {
     reset_loop = false;
     reset_httpd = false;
     preserve_connections = false;
+    skip_video_rebuild = false;
     n_video_renderers = 0;
     n_audio_renderers = 0;
     if (use_video) {
@@ -1619,6 +1881,14 @@ static void parse_arguments (int argc, char *argv[]) {
                     continue;
                 }
             }
+        } else if (arg == "-capture") {
+            if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
+            capture_filename = argv[++i];
+            do_capture = true;
+        } else if (arg == "-replay") {
+            if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
+            replay_filename = argv[++i];
+            do_replay = true;
         } else if (arg == "-nohold") {
             nohold = 1;
         } else if (arg == "-al") {
@@ -2202,9 +2472,19 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
         LOGD("video_reset: type = RTP_to_HLS_Shutdown");
         preserve_connections = true;
     case RESET_TYPE_RTP_SHUTDOWN:
-        LOGD("video_reset: type = RTP_Shutdown");      
+        LOGD("video_reset: type = RTP_Shutdown");
         if (use_video) {
-            video_renderer_stop();
+            if (!hls_support && !preserve_connections) {
+                /* Plain mirror-mode reconnect: leave the pipeline running
+                 * instead of stopping it, so the post-main_loop block below
+                 * doesn't need to destroy+recreate it (see skip_video_rebuild
+                 * comment above). The next connection's frames (primed with
+                 * fresh SPS/PPS by raop_rtp_mirror.c, same as any format
+                 * change mid-stream) resume decoding normally. */
+                skip_video_rebuild = true;
+            } else {
+                video_renderer_stop();
+            }
         }
         remote_clock_offset = 0;
         relaunch_video = true;
@@ -2381,6 +2661,7 @@ extern "C" void audio_process (void *cls, raop_ntp_t *ntp, audio_decode_struct *
         default:
             break;
         }
+        if (do_capture) cap_write('A', data->data, data->data_len, data->ntp_time_remote);
         audio_renderer_render_buffer(data->data, &(data->data_len), &(data->seqnum), &(data->ntp_time_remote));
     }
 }
@@ -2401,6 +2682,7 @@ extern "C" void video_process (void *cls, raop_ntp_t *ntp, video_decode_struct *
         uint64_t pts_mismatch = 0;
         do {
             data->ntp_time_remote = data->ntp_time_remote + remote_clock_offset;
+            if (do_capture && count == 0) cap_write('V', data->data, data->data_len, data->ntp_time_remote);
             pts_mismatch = video_renderer_render_buffer(data->data, &(data->data_len), &(data->nal_count), &(data->ntp_time_remote));
             if (pts_mismatch) {
                 LOGI("adjust timestamps by %8.6f secs", (double) pts_mismatch / SECOND_IN_NSECS);
@@ -2434,12 +2716,14 @@ extern "C" void video_resume (void *cls) {
 
 
 extern "C" void audio_flush (void *cls) {
+    if (do_capture) cap_write('a', NULL, 0, 0);
     if (use_audio) {
         audio_renderer_flush();
     }
 }
 
 extern "C" void video_flush (void *cls) {
+    if (do_capture) cap_write('v', NULL, 0, 0);
     if (use_video) {
         video_renderer_flush();
     }
@@ -2515,6 +2799,7 @@ extern "C" void audio_get_format (void *cls, unsigned char *ct, unsigned short *
     }
     audio_type = type;
     
+    if (do_capture) cap_write('C', NULL, 0, (uint64_t) *ct);
     if (use_audio) {
       audio_renderer_start(ct);
     }
@@ -3287,6 +3572,21 @@ int main (int argc, char *argv[]) {
         }	  
     }
 
+    if (do_replay) {
+        LOGI("REPLAY MODE: feeding captured session from %s (no AirPlay)", replay_filename.c_str());
+        replay_run();
+        cleanup();
+    }
+
+    if (do_capture) {
+        capture_fp = fopen(capture_filename.c_str(), "wb");
+        if (!capture_fp) {
+            LOGE("could not open capture file %s", capture_filename.c_str());
+        } else {
+            LOGI("CAPTURE MODE: recording decrypted session to %s", capture_filename.c_str());
+        }
+    }
+
     if (start_dnssd(server_hw_addr, server_name)) {
         cleanup();
     }
@@ -3329,7 +3629,7 @@ int main (int argc, char *argv[]) {
         if (use_audio) {
             audio_renderer_stop();
         }
-        if (use_video && (close_window || preserve_connections || full_video_reset)) {
+        if (use_video && !skip_video_rebuild && (close_window || preserve_connections || full_video_reset)) {
             video_renderer_destroy();
             if (!preserve_connections) {
                 url.erase();

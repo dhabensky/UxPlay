@@ -26,6 +26,9 @@
 #include "audio_renderer.h"
 #define SECOND_IN_NSECS 1000000000UL
 
+/* A/V sync self-measurement probe installer, defined in video_renderer.c */
+void install_av_sync_probe(GstElement *pipeline);
+
 #define NFORMATS 2     /* set to 4 to enable AAC_LD and PCM:  allowed, but  never seen in real-world use */
 
 static GstClockTime gst_audio_pipeline_base_time = GST_CLOCK_TIME_NONE;
@@ -145,7 +148,11 @@ void audio_renderer_init(logger_t *render_logger, const char* audiosink, const b
         renderer_type[i] = (audio_renderer_t *)  calloc(1,sizeof(audio_renderer_t));
         g_assert(renderer_type[i]);
         GString *launch = g_string_new("appsrc name=audio_source ! ");
-        g_string_append(launch, "queue ! ");
+        /* Cap the audio queue at 300ms (default is 1s): keeps the post-pause
+         * drain tail and seek/restart resync transients short. Non-leaky (no
+         * drops) so continuous audio stays glitch-free; it only bounds how much
+         * gets buffered on a burst. */
+        g_string_append(launch, "queue max-size-buffers=0 max-size-bytes=0 max-size-time=300000000 ! ");
         switch (i) {
         case 0:    /* AAC-ELD */
         case 2:    /* AAC-LC */
@@ -202,6 +209,7 @@ void audio_renderer_init(logger_t *render_logger, const char* audiosink, const b
 
         g_assert (renderer_type[i]->pipeline);
         gst_pipeline_use_clock(GST_PIPELINE_CAST(renderer_type[i]->pipeline), clock);
+        install_av_sync_probe(renderer_type[i]->pipeline);
         renderer_type[i]->bus = gst_element_get_bus(renderer_type[i]->pipeline);
         renderer_type[i]->appsrc = gst_bin_get_by_name (GST_BIN (renderer_type[i]->pipeline), "audio_source");
         renderer_type[i]->volume = gst_bin_get_by_name (GST_BIN (renderer_type[i]->pipeline), "volume");
@@ -315,9 +323,12 @@ void audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned s
         if (pts >= gst_audio_pipeline_base_time) {
             pts -= gst_audio_pipeline_base_time;
         } else {
-            logger_log(logger, LOGGER_ERR, "*** invalid ntp_time < gst_audio_pipeline_base_time\n%8.6f ntp_time\n%8.6f base_time",
-                       ((double) *ntp_time) / SECOND_IN_NSECS, ((double) gst_audio_pipeline_base_time) / SECOND_IN_NSECS);
-            return;
+            /* ntp < base_time: a clock jump from a seek/reconnect. Don't drop all
+             * audio (that made the sound "fly off") — re-base to this frame and
+             * keep playing; subsequent frames get valid PTS relative to it. */
+            logger_log(logger, LOGGER_DEBUG, "audio ntp < base_time; re-basing audio clock (seek/reconnect)");
+            gst_audio_pipeline_base_time = pts;
+            pts = 0;
         }
     }
     if (data_len == 0 || renderer == NULL) return;
@@ -381,6 +392,16 @@ void audio_renderer_set_volume(double volume) {
 }
 
 void audio_renderer_flush() {
+    /* AirPlay FLUSH = seek/pause: drop all audio buffered in the pipeline so the
+     * stale pre-seek audio doesn't keep playing and drag A/V out of sync. With
+     * sync=false the sink plays buffers as they arrive, so resetting the segment
+     * (flush_stop reset_time=TRUE) is harmless for timing; appsrc emits a fresh
+     * segment on its next buffer. Flush the whole pipeline so appsrc's internal
+     * queue, the queue element, decoder and alsasink are all cleared. */
+    if (renderer && renderer->pipeline) {
+        gst_element_send_event(renderer->pipeline, gst_event_new_flush_start());
+        gst_element_send_event(renderer->pipeline, gst_event_new_flush_stop(TRUE));
+    }
 }
 
 void audio_renderer_destroy() {
@@ -407,11 +428,16 @@ static gboolean gstreamer_audio_pipeline_bus_callback(GstBus *bus, GstMessage *m
         logger_log(logger, LOGGER_INFO, "GStreamer error (audio): %s %s", GST_MESSAGE_SRC_NAME(message),err->message);
         g_error_free(err);
         g_free(debug);
-        if (renderer->appsrc) {
+        /* renderer can be NULL here: e.g. this bus watch can fire for a pipeline
+         * whose renderer_type[] slot was never made the active "renderer" (audio
+         * mode picks one of several format-specific pipelines), or during teardown. */
+        if (renderer && renderer->appsrc) {
             gst_app_src_end_of_stream (GST_APP_SRC(renderer->appsrc));
         }
         gst_bus_set_flushing(bus, TRUE);
-        gst_element_set_state (renderer->pipeline, GST_STATE_READY);
+        if (renderer) {
+            gst_element_set_state (renderer->pipeline, GST_STATE_READY);
+        }
         g_main_loop_quit( (GMainLoop *) loop);
 	break;
     }

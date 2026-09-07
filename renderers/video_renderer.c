@@ -95,6 +95,13 @@ struct video_renderer_s {
 
 static video_renderer_t *renderer = NULL;
 static video_renderer_t *renderer_type[NCODECS] = {0};
+/* guards against raop_rtp_mirror_thread calling gst_app_src_push_buffer()
+ * on an appsrc whose pipeline hasn't finished its (potentially slow, e.g.
+ * on kmssink/DRM setup) state transition yet: without this, buffers can
+ * arrive from a client and be pushed while video_renderer_init/start is
+ * still synchronously blocked inside gst_element_set_state(), racing on
+ * the same GstElement and causing a segfault deep in libgstapp. */
+static volatile gint video_renderer_ready = 0;
 static int n_renderers = NCODECS;
 static char h264[] = "h264";
 static char h265[] = "h265";
@@ -249,12 +256,99 @@ g_string_replace (GString     *string,
 }
 #endif
 
+/* --- A/V sync self-measurement (autonomous, no mic/camera) ---
+ * The test clip flashes full white + a loud audio accent simultaneously every
+ * few seconds. This probe detects, at each sink, the white video frame and the
+ * loud audio buffer by inspecting buffer CONTENT, and logs the wall-clock
+ * (pipeline realtime clock) at which each marker reaches the sink. Comparing the
+ * logged video-flash times vs audio-accent times gives the true output A/V
+ * offset. Debounced so each ~150ms marker logs once. */
+static GstPadProbeReturn av_sync_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) {
+    (void) pad;
+    GstBuffer *buf = GST_PAD_PROBE_INFO_BUFFER(info);
+    GstElement *sink = (GstElement *) user_data;
+    if (!buf) return GST_PAD_PROBE_OK;
+    GstClock *clock = gst_element_get_clock(sink);
+    if (!clock) return GST_PAD_PROBE_OK;
+    GstClockTime now = gst_clock_get_time(clock);
+    gst_object_unref(clock);
+    GstClockTime base = gst_element_get_base_time(sink);
+    if (!GST_CLOCK_TIME_IS_VALID(base) || now < base) return GST_PAD_PROBE_OK;
+    double t_ms = (double)(now - base) / 1000000.0;
+
+    const gchar *name = GST_ELEMENT_NAME(sink);
+    gboolean is_audio = (name && strstr(name, "alsa"));
+    GstMapInfo map;
+    if (!gst_buffer_map(buf, &map, GST_MAP_READ)) return GST_PAD_PROBE_OK;
+    gboolean marker = FALSE;
+    if (is_audio) {
+        /* S16LE samples: peak amplitude. Loud accent >> quiet baseline. */
+        gint16 *s = (gint16 *) map.data;
+        gsize n = map.size / 2;
+        int loud = 0, cnt = 0;
+        for (gsize i = 0; i < n; i += 3) { int a = s[i]; if (a < 0) a = -a; if (a > 26000) loud++; cnt++; }
+        int pct = cnt > 0 ? (loud * 100 / cnt) : 0;   /* accent burst saturates far more samples than baseline */
+        marker = (pct > 55);
+        if (g_getenv("UX_PROBE_DBG")) { static int ac = 0; if ((ac++ % 50) == 0) g_print("APROBE loud_pct=%d\n", pct); }
+    } else {
+        /* Count bright pixels in the Y plane (first ~2/3 of an I420/NV12 buffer).
+         * The flash may cover only the player window (mirrored desktop, not full
+         * screen), so use the FRACTION of near-white Y samples, not the average. */
+        gsize ylen = (map.size / 3) * 2;
+        gsize step = ylen > 8192 ? ylen / 4096 : 1;
+        if (step == 0) step = 1;
+        int bright = 0, cnt = 0;
+        for (gsize i = 0; i < ylen; i += step) { if (map.data[i] > 200) bright++; cnt++; }
+        int pct = cnt > 0 ? (bright * 100 / cnt) : 0;
+        marker = (pct > 15);
+        if (g_getenv("UX_PROBE_DBG")) {
+            static int vc = 0;
+            if ((vc++ % 30) == 0) g_print("VPROBE size=%zu bright_pct=%d\n", map.size, pct);
+        }
+    }
+    gst_buffer_unmap(buf, &map);
+
+    GstClockTime *last = (GstClockTime *) g_object_get_data(G_OBJECT(sink), "avlast");
+    if (!last) { last = g_new0(GstClockTime, 1); g_object_set_data_full(G_OBJECT(sink), "avlast", last, g_free); }
+    if (marker && (now < *last || now - *last > 800 * GST_MSECOND)) {
+        *last = now;
+        g_print("AVMARK %s t=%.1f ms\n", is_audio ? "audio" : "video", t_ms);
+    }
+    return GST_PAD_PROBE_OK;
+}
+
+void install_av_sync_probe(GstElement *pipeline) {
+    if (!g_getenv("UX_PROBE")) return;   /* opt-in: maps every buffer, only for A/V-sync measurement */
+    GstIterator *it = gst_bin_iterate_sinks(GST_BIN(pipeline));
+    GValue v = G_VALUE_INIT;
+    gboolean done = FALSE;
+    while (!done) {
+        switch (gst_iterator_next(it, &v)) {
+        case GST_ITERATOR_OK: {
+            GstElement *sink = GST_ELEMENT(g_value_get_object(&v));
+            GstPad *p = gst_element_get_static_pad(sink, "sink");
+            if (p) {
+                gst_pad_add_probe(p, GST_PAD_PROBE_TYPE_BUFFER, av_sync_probe, sink, NULL);
+                gst_object_unref(p);
+            }
+            g_value_reset(&v);
+            break;
+        }
+        case GST_ITERATOR_RESYNC: gst_iterator_resync(it); break;
+        default: done = TRUE; break;
+        }
+    }
+    g_value_unset(&v);
+    gst_iterator_free(it);
+}
+
 void video_renderer_init(logger_t *render_logger, const char *server_name, videoflip_t videoflip[2], const char *parser, const char * rtp_pipeline,
                           const char *decoder, const char *converter, const char *videosink, const char *videosink_options, 
                           bool initial_fullscreen, bool video_sync, bool h265_support, bool coverart_support, guint playbin_version, const char *uri) {
     GError *error = NULL;
     GstCaps *caps = NULL;
     bool rtp = (bool) strlen(rtp_pipeline);
+    g_atomic_int_set(&video_renderer_ready, 0);
     hls_video = (uri != NULL);
     /* videosink choices that are auto */
     auto_videosink = (strstr(videosink, "autovideosink") || strstr(videosink, "fpsdisplaysink"));
@@ -361,7 +455,7 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
             if (jpeg_pipeline) {
                 g_string_append(launch, "jpegdec ");
             } else {
-                g_string_append(launch, "queue ! ");
+                g_string_append(launch, "queue max-size-buffers=0 max-size-bytes=0 max-size-time=0 ! ");
                 g_string_append(launch, parser);
                 g_string_append(launch, " ! ");
                 if (!rtp) {
@@ -430,6 +524,7 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
             g_string_free(launch, TRUE);
             gst_caps_unref(caps);
             gst_object_unref(clock);
+            install_av_sync_probe(renderer_type[i]->pipeline);
             if (jpeg_pipeline) {
                  renderer_type[i]->textsrc = gst_bin_get_by_name(GST_BIN(renderer_type[i]->pipeline), "metadata_overlay");
                  g_object_set(G_OBJECT(renderer_type[i]->textsrc), "text", "", "shaded-background", TRUE, "font-desc", "Sans, 16",  NULL);
@@ -509,19 +604,25 @@ void video_renderer_resume() {
 
 void video_renderer_start() {
     GstState state;
+    GstStateChangeReturn ret;
     const gchar *state_name = NULL;
     if (hls_video) {
         g_object_set (G_OBJECT (renderer->pipeline), "uri", renderer->uri, NULL);
         gst_element_set_state (renderer->pipeline, GST_STATE_PAUSED);
-	gst_element_get_state(renderer->pipeline, &state, NULL, 1000 * GST_MSECOND);
+        do {
+            ret = gst_element_get_state(renderer->pipeline, &state, NULL, 1000 * GST_MSECOND);
+        } while (ret == GST_STATE_CHANGE_ASYNC);
 	state_name = gst_element_state_get_name(state);
 	logger_log(logger, LOGGER_DEBUG, "video renderer_start: state %s", state_name);
+        g_atomic_int_set(&video_renderer_ready, 1);
         return;
-    } 
+    }
     /* when not hls, start both h264 and h265 pipelines; will shut down the "wrong" one when we know the codec */
     for (int i = 0; i < n_renderers; i++) {
         gst_element_set_state (renderer_type[i]->pipeline, GST_STATE_PAUSED);
-        gst_element_get_state(renderer_type[i]->pipeline, &state, NULL, 1000 * GST_MSECOND);
+        do {
+            ret = gst_element_get_state(renderer_type[i]->pipeline, &state, NULL, 1000 * GST_MSECOND);
+        } while (ret == GST_STATE_CHANGE_ASYNC);
         state_name = gst_element_state_get_name(state);
         logger_log(logger, LOGGER_DEBUG, "video renderer_start: renderer %d %p state %s", i, renderer_type[i], state_name);
     }
@@ -530,6 +631,10 @@ void video_renderer_start() {
 #ifdef X_DISPLAY_FIX
     X11_search_attempts = 0;
 #endif
+    /* only now, after every renderer's pipeline has confirmed (not just optimistically
+     * assumed after a single timed wait) leaving GST_STATE_CHANGE_ASYNC, is it safe for
+     * the RTP mirror thread to start pushing buffers into any renderer's appsrc. */
+    g_atomic_int_set(&video_renderer_ready, 1);
 }
 
 /* used to find any X11 Window used by the playbin (HLS) pipeline after it starts playing. 
@@ -609,6 +714,11 @@ void video_renderer_display_jpeg(const void *data, int *data_len) {
 
 uint64_t video_renderer_render_buffer(unsigned char* data, int *data_len, int *nal_count, uint64_t *ntp_time) {
     GstBuffer *buffer = NULL;
+    if (!g_atomic_int_get(&video_renderer_ready)) {
+        /* pipeline (e.g. kmssink's DRM setup) hasn't finished its state transition yet:
+         * drop this frame rather than race on renderer->appsrc, see comment at its declaration. */
+        return 0;
+    }
     GstClockTime pts = (GstClockTime) *ntp_time; /*now in nsecs */
     //GstClockTimeDiff latency = GST_CLOCK_DIFF(gst_element_get_current_clock_time (renderer->appsrc), pts);
     if (sync) {
@@ -761,6 +871,7 @@ static void video_renderer_destroy_instance(video_renderer_t *renderer) {
 }
 
 void video_renderer_destroy() {
+    g_atomic_int_set(&video_renderer_ready, 0);
     for (int i = 0; i < n_renderers; i++) {
         if (renderer_type[i]) {
             video_renderer_destroy_instance(renderer_type[i]);
@@ -926,10 +1037,14 @@ static gboolean gstreamer_video_pipeline_bus_callback(GstBus *bus, GstMessage *m
         }
         g_error_free (err);
         g_free (debug);
-        if (renderer->appsrc) {
+        /* renderer (the one active/selected pipeline) can be NULL here: this bus watch
+         * is attached per-pipeline before codec selection picks which renderer_type[]
+         * becomes the global "renderer", so an error on a not-yet-selected pipeline
+         * (or during teardown) must not dereference a NULL renderer. */
+        if (renderer && renderer->appsrc) {
             gst_app_src_end_of_stream (GST_APP_SRC(renderer->appsrc));
         }
-        if (!hls_video || closed_window) {
+        if (renderer && (!hls_video || closed_window)) {
             gst_bus_set_flushing(bus, TRUE);
             gst_element_set_state (renderer->pipeline, GST_STATE_READY);
             g_main_loop_quit( (GMainLoop *) loop);
@@ -939,7 +1054,7 @@ static gboolean gstreamer_video_pipeline_bus_callback(GstBus *bus, GstMessage *m
     case GST_MESSAGE_EOS:
         /* end-of-stream */
         logger_log(logger, LOGGER_INFO, "GStreamer: End-Of-Stream (video)");
-        if (hls_video) {
+        if (hls_video && renderer) {
             gst_bus_set_flushing(bus, TRUE);
             gst_element_set_state (renderer->pipeline, GST_STATE_READY);
             renderer->eos = TRUE;
@@ -979,7 +1094,7 @@ static gboolean gstreamer_video_pipeline_bus_callback(GstBus *bus, GstMessage *m
             }
 
         }
-        if (renderer->autovideo) {
+        if (renderer && renderer->autovideo) {
             char *sink = strstr(GST_MESSAGE_SRC_NAME(message), "-actual-sink-");
             if (sink) {
                 sink += strlen("-actual-sink-");
@@ -1057,29 +1172,40 @@ int video_renderer_choose_codec (bool video_is_jpeg, bool video_is_h265) {
             renderer_used = renderer_type[type_264];
         }
     }
-    if (renderer_used == NULL) {
-        return -1;
-    } else if (renderer_used == renderer) {
-        return 0;
-    } else if (renderer) {
+    /* Guard against a NULL / not-yet-(re)built renderer or pipeline. On a rapid
+     * reconnect this callback (RAOP mirror thread) can race pipeline (re)creation
+     * on the main thread; never dereference a NULL here (that segfaulted). Fail
+     * softly — the client re-sends the codec. */
+    if (renderer_used == NULL || renderer_used->pipeline == NULL) {
         return -1;
     }
-    renderer = renderer_used;
-    gst_element_set_state (renderer->pipeline, GST_STATE_PLAYING);
+    /* Ensure the chosen pipeline is PLAYING. This is idempotent for an already-
+     * active renderer, and crucially RESTARTS it after a reconnect where
+     * video_renderer_stop() left it in GST_STATE_NULL (otherwise the video stays
+     * frozen). Operate only on the LOCAL pointer; publish the global `renderer`
+     * LAST so a concurrent main-thread write can't make us deref a half-updated
+     * global (that segfaulted). */
+    gst_element_set_state (renderer_used->pipeline, GST_STATE_PLAYING);
     GstState old_state, new_state;
-    if (gst_element_get_state(renderer->pipeline, &old_state, &new_state, 100 * GST_MSECOND) == GST_STATE_CHANGE_FAILURE) {
-        g_error("video pipeline failed to go into playing state");
+    if (gst_element_get_state(renderer_used->pipeline, &old_state, &new_state, 100 * GST_MSECOND) == GST_STATE_CHANGE_FAILURE) {
+        logger_log(logger, LOGGER_ERR, "video pipeline failed to go into playing state");
         return -1;
+    }
+    /* refresh base_time (it changes if the pipeline was restarted from NULL after
+     * a reconnect) so the ntp->pts mapping stays correct. */
+    gst_video_pipeline_base_time = gst_element_get_base_time(renderer_used->appsrc);
+    if (renderer_used == renderer) {
+        return 0;   /* was already the active renderer (now re-confirmed PLAYING) */
     }
     logger_log(logger, LOGGER_DEBUG, "video_pipeline state change from %s to %s\n",
                gst_element_state_get_name (old_state),gst_element_state_get_name (new_state));
-    gst_video_pipeline_base_time = gst_element_get_base_time(renderer->appsrc);
-    if (strstr(renderer->codec, h265)) {
+    if (strstr(renderer_used->codec, h265)) {
         logger_log(logger, LOGGER_INFO, "*** video format is h265 high definition (HD/4K) video %dx%d", width, height);
     }
-    /* destroy unused renderers */
+    renderer = renderer_used;   /* publish the active renderer last */
+    /* destroy the other (unused) renderers */
     for (int i = 0; i < n_renderers; i++) {
-        if (renderer_type[i] == renderer) {
+        if (renderer_type[i] == renderer_used) {
             continue;
         }
 	if (renderer_type[i]) {
