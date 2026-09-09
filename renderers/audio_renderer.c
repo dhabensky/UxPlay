@@ -375,7 +375,26 @@ void audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned s
         break;
     }
     if (valid) {
-        gst_app_src_push_buffer(GST_APP_SRC(renderer->appsrc), buffer);
+        GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(renderer->appsrc), buffer);
+        if (ret != GST_FLOW_OK) {
+            /* appsrc has stopped accepting data -- most likely GST_FLOW_EOS,
+             * if gst_app_src_end_of_stream() was called on this appsrc (via
+             * audio_renderer_stop(), on every RAOP disconnect/reconnect
+             * cycle) and something about the following state transition
+             * didn't fully clear that internally. Previously this failure
+             * was completely silent: audio would just stop forever, with
+             * zero log trace, recoverable only by the client tearing down
+             * and re-establishing the whole AirPlay session from scratch
+             * (which goes through the exact same audio_renderer_stop()/
+             * audio_renderer_start() pair below, just triggered
+             * externally). Self-heal the same way here instead of waiting
+             * on the user to notice and manually reconnect. */
+            logger_log(logger, LOGGER_ERR, "*** ERROR gst_app_src_push_buffer failed, GstFlowReturn = %d (%s); restarting audio renderer",
+                       ret, gst_flow_get_name(ret));
+            unsigned char ct = renderer->ct;
+            audio_renderer_stop();
+            audio_renderer_start(&ct);
+        }
     } else {
         logger_log(logger, LOGGER_ERR, "*** ERROR invalid  audio frame (compression_type %d) skipped ", renderer->ct);
         logger_log(logger, LOGGER_ERR, "***       first byte of invalid frame was  0x%2.2x ", (unsigned int) data[0]);
