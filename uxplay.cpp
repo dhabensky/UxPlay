@@ -2686,9 +2686,11 @@ extern "C" void audio_set_volume (void *cls, float volume) {
     } else if (volume < -30.0f) {
         LOGE(" invalid AirPlay volume %f", volume);
         frac = 0.0;
+        volume = -30.0f;
     } else if (volume > 0.0f) {
         LOGE(" invalid AirPlay volume %f", volume);
         frac = 1.0;
+        volume = 0.0f;
     } else if (volume == -30.0f) {
         frac = 0.0;
     } else if (volume == 0.0f) {
@@ -2697,6 +2699,20 @@ extern "C" void audio_set_volume (void *cls, float volume) {
         frac = (double) ( (30.0f + volume) / 30.0f);
         frac = (frac > 1.0) ? 1.0 : frac;
     }
+
+    /* Remember the real current volume (AirPlay's own -30:0 dB scale, same
+     * scale "-vol"/initial_volume already uses) so a later GET_PARAMETER or
+     * a new session reports what's actually playing right now. Without
+     * this, audio_set_client_volume() below always returns whatever "-vol"
+     * (or its 0.0 = max default) was at process startup, forever -- the
+     * receiver perpetually claims to be at max volume regardless of the
+     * real, live level, no matter how many times it's actually changed.
+     * That's what caused every new AirPlay connection to appear to start
+     * at max volume, decoupled from the client's real current level, and
+     * the first touch of the volume control afterward to jump straight to
+     * the client's real level instead of stepping gradually from where
+     * the receiver actually was. */
+    initial_volume = volume;
 
     /* frac is length of volume slider as fraction of max length */
     /* also (steps/16) where steps is number of discrete steps above mute (16 = full volume) */
