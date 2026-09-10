@@ -2448,24 +2448,31 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
     case RESET_TYPE_RTP_SHUTDOWN:
         LOGD("video_reset: type = RTP_Shutdown");
         if (use_video) {
-            /* Previously: plain mirror-mode reconnects (!hls_support &&
-             * !preserve_connections) set skip_video_rebuild=true and left
-             * the pipeline running untouched instead of stopping it, to
-             * make a quick reconnect cheap (no destroy+recreate). That
-             * fast path meant an explicit "Stop Mirroring" click on the
-             * client -- which reaches this exact case via
-             * raop_handler_teardown() -- never called video_renderer_stop()
-             * or video_renderer_destroy() at all, leaving the last
-             * mirrored frame (potentially sensitive) on the physical
-             * display indefinitely with the pipeline still holding DRM
-             * master, confirmed as a real information-disclosure bug.
-             * This project's own stated design priority (see README) is
-             * "latency doesn't matter... audio/video sync does" -- the
-             * reconnect-latency optimization this skipped isn't something
-             * this deployment needs, so always stop (and let it rebuild
-             * via the normal post-main_loop path) rather than leave stale
-             * content on screen. */
-            video_renderer_stop();
+            if (!hls_support && !preserve_connections) {
+                /* Reverted an attempt to always video_renderer_stop() here
+                 * (to fix a frozen-last-frame info-disclosure bug on
+                 * explicit "Stop Mirroring") -- it broke re-mirroring
+                 * entirely (confirmed on real hardware: video never
+                 * started again after a subsequent connection). This
+                 * skip_video_rebuild fast path is load-bearing, exercised
+                 * by the replay/reconnect test tooling (see the comment
+                 * near replay_do_reconnect), not safe to remove casually.
+                 * Plain mirror-mode reconnect: leave the pipeline running
+                 * instead of stopping it, so the post-main_loop block below
+                 * doesn't need to destroy+recreate it. The next connection's
+                 * frames (primed with fresh SPS/PPS by raop_rtp_mirror.c,
+                 * same as any format change mid-stream) resume decoding
+                 * normally. The frozen-frame issue is still addressed, just
+                 * not instantaneously: feedback_callback's -reset N second
+                 * client-silence timeout (unaffected by skip_video_rebuild,
+                 * since it never sets it) still reaches
+                 * video_renderer_destroy()'s blanking call within N seconds
+                 * of a real disconnect, whether or not the client sent an
+                 * explicit TEARDOWN first. */
+                skip_video_rebuild = true;
+            } else {
+                video_renderer_stop();
+            }
         }
         remote_clock_offset = 0;
         relaunch_video = true;

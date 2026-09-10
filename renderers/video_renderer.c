@@ -803,14 +803,38 @@ static void video_renderer_blank_display() {
      * touch the main pipeline's negotiated caps/resolution/appsrc state
      * at all, and works regardless of what the last session's video
      * looked like. */
+    GError *parse_err = NULL;
     GstElement *blank = gst_parse_launch(
-        "videotestsrc pattern=black num-buffers=1 ! kmssink force-modesetting=true", NULL);
+        "videotestsrc pattern=black num-buffers=1 ! kmssink force-modesetting=true", &parse_err);
     if (!blank) {
-        logger_log(logger, LOGGER_ERR, "*** ERROR: could not build display-blanking pipeline");
+        logger_log(logger, LOGGER_ERR, "could not build display-blanking pipeline: %s",
+                   parse_err ? parse_err->message : "unknown");
+        if (parse_err) g_error_free(parse_err);
         return;
     }
-    gst_element_set_state(blank, GST_STATE_PLAYING);
+    if (parse_err) {
+        /* gst_parse_launch can return a non-NULL, partially-usable
+         * pipeline AND set an error (e.g. a non-fatal warning about one
+         * element) -- log it either way instead of silently discarding. */
+        logger_log(logger, LOGGER_ERR, "display-blanking pipeline parse warning: %s", parse_err->message);
+        g_error_free(parse_err);
+    }
+    GstStateChangeReturn sret = gst_element_set_state(blank, GST_STATE_PLAYING);
+    logger_log(logger, LOGGER_DEBUG, "display-blanking pipeline set_state(PLAYING) returned: %s",
+               gst_element_state_change_return_get_name(sret));
+    if (sret == GST_STATE_CHANGE_FAILURE) {
+        logger_log(logger, LOGGER_ERR, "display-blanking pipeline failed to reach PLAYING (most likely could not acquire DRM master)");
+        gst_element_set_state(blank, GST_STATE_NULL);
+        gst_object_unref(blank);
+        return;
+    }
     GstBus *bus = gst_element_get_bus(blank);
+    if (!bus) {
+        logger_log(logger, LOGGER_ERR, "display-blanking pipeline has no bus (element type: %s)", G_OBJECT_TYPE_NAME(blank));
+        gst_element_set_state(blank, GST_STATE_NULL);
+        gst_object_unref(blank);
+        return;
+    }
     GstMessage *msg = gst_bus_timed_pop_filtered(bus, 2 * GST_SECOND,
         (GstMessageType)(GST_MESSAGE_EOS | GST_MESSAGE_ERROR));
     if (msg) {
@@ -818,13 +842,13 @@ static void video_renderer_blank_display() {
             GError *err = NULL;
             gchar *debug = NULL;
             gst_message_parse_error(msg, &err, &debug);
-            logger_log(logger, LOGGER_ERR, "*** ERROR blanking display: %s", err ? err->message : "unknown");
+            logger_log(logger, LOGGER_ERR, "blanking display failed: %s", err ? err->message : "unknown");
             if (err) g_error_free(err);
             g_free(debug);
         }
         gst_message_unref(msg);
     } else {
-        logger_log(logger, LOGGER_ERR, "*** ERROR: display-blanking pipeline timed out");
+        logger_log(logger, LOGGER_ERR, "display-blanking pipeline timed out waiting for EOS");
     }
     gst_object_unref(bus);
     gst_element_set_state(blank, GST_STATE_NULL);
