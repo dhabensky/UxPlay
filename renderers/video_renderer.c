@@ -788,6 +788,49 @@ void video_renderer_hls_ready() {
     }
 }
 
+static void video_renderer_blank_display() {
+    /* Setting the main pipeline to GST_STATE_NULL below stops it from
+     * pushing new frames and releases DRM master, but that does NOT
+     * itself clear the physical display: kmssink doesn't blank the KMS
+     * plane/CRTC on teardown, it just stops scanning out anything new --
+     * whatever frame was last displayed (potentially sensitive content
+     * from the mirrored screen) stays visible on the TV indefinitely,
+     * even with no source device connected anymore. Reported as a real
+     * privacy/information-disclosure issue, not just a cosmetic one. Fix:
+     * briefly grab DRM master with a throwaway pipeline that paints
+     * exactly one black frame, overwriting whatever was there, then
+     * release master again -- self-contained, doesn't need to know or
+     * touch the main pipeline's negotiated caps/resolution/appsrc state
+     * at all, and works regardless of what the last session's video
+     * looked like. */
+    GstElement *blank = gst_parse_launch(
+        "videotestsrc pattern=black num-buffers=1 ! kmssink force-modesetting=true", NULL);
+    if (!blank) {
+        logger_log(logger, LOGGER_ERR, "*** ERROR: could not build display-blanking pipeline");
+        return;
+    }
+    gst_element_set_state(blank, GST_STATE_PLAYING);
+    GstBus *bus = gst_element_get_bus(blank);
+    GstMessage *msg = gst_bus_timed_pop_filtered(bus, 2 * GST_SECOND,
+        (GstMessageType)(GST_MESSAGE_EOS | GST_MESSAGE_ERROR));
+    if (msg) {
+        if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR) {
+            GError *err = NULL;
+            gchar *debug = NULL;
+            gst_message_parse_error(msg, &err, &debug);
+            logger_log(logger, LOGGER_ERR, "*** ERROR blanking display: %s", err ? err->message : "unknown");
+            if (err) g_error_free(err);
+            g_free(debug);
+        }
+        gst_message_unref(msg);
+    } else {
+        logger_log(logger, LOGGER_ERR, "*** ERROR: display-blanking pipeline timed out");
+    }
+    gst_object_unref(bus);
+    gst_element_set_state(blank, GST_STATE_NULL);
+    gst_object_unref(blank);
+}
+
 void video_renderer_stop() {
     if (renderer) {
         logger_log(logger, LOGGER_DEBUG,"video_renderer_stop");
@@ -796,6 +839,12 @@ void video_renderer_stop() {
         }
         gst_element_set_state (renderer->pipeline, GST_STATE_NULL);
         //gst_element_set_state (renderer->playbin, GST_STATE_NULL);
+        /* Block until DRM master is actually released before the
+         * blanking pipeline below tries to grab it -- kmssink requires
+         * exclusive master access on this hardware (same constraint that
+         * requires masking getty@tty1.service). */
+        gst_element_get_state(renderer->pipeline, NULL, NULL, 2 * GST_SECOND);
+        video_renderer_blank_display();
      }
 }
 
@@ -877,6 +926,23 @@ void video_renderer_destroy() {
             video_renderer_destroy_instance(renderer_type[i]);
         }
     }
+    /* This, not video_renderer_stop(), is the teardown path actually
+     * taken on a real "client stopped sharing" disconnect (uxplay.cpp's
+     * feedback_callback fires after -reset N seconds of client silence,
+     * setting full_video_reset, which routes into main_loop()'s post-loop
+     * block calling this function directly -- video_renderer_stop() is
+     * not in that call chain at all). Same underlying issue as there:
+     * video_renderer_destroy_instance() above tears each pipeline down to
+     * GST_STATE_NULL, which does not itself clear the physical KMS
+     * display -- blank it here too so a real session end doesn't leave
+     * the last (potentially sensitive) mirrored frame on screen
+     * indefinitely. Also reached by a handful of internal reset paths
+     * that immediately reinit and restart the renderer (e.g. HLS EOS) --
+     * an extra black frame during an already-visible pipeline
+     * rebuild/reconnect hiccup there is an acceptable trade-off against
+     * ever leaving stale content on screen indefinitely.
+     */
+    video_renderer_blank_display();
 }
 
 static void get_stream_status_name(GstStreamStatusType type, char *name, size_t len) {

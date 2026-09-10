@@ -952,6 +952,36 @@ static gboolean video_eos_watch_callback (gpointer loop) {
     return TRUE;
 }
 
+static int register_dnssd();
+static void unregister_dnssd();
+
+static gboolean dnssd_refresh_callback (gpointer loop) {
+    /* Periodically re-publish the mDNS/DNS-SD records instead of only
+     * ever registering once at startup. Root cause of a real, recurring
+     * bug (confirmed via journalctl on the real device): avahi-daemon
+     * does a full withdraw-then-rejoin cycle on an interface whenever it
+     * sees ANY netlink address event there -- including a routine DHCP
+     * lease renewal that keeps the exact same IP ("Withdrawing address
+     * record... no longer relevant for mDNS", then 2 seconds later "New
+     * relevant interface... Registering new address record", triggered
+     * by nothing but dhclient's normal periodic renewal, ~24 minutes
+     * after boot on the network this was observed on). dnssd_register_raop/
+     * airplay (lib/dnssd.c) call DNSServiceRegister() with a NULL reply
+     * callback, so this process has no way to learn its previously
+     * registered _raop._tcp/_airplay._tcp entries silently dropped out
+     * during that cycle -- the device goes invisible in every client's
+     * AirPlay picker until something notices and manually restarts
+     * uxplay/avahi. Since this recurs on every DHCP renewal indefinitely,
+     * refresh well inside that interval so the advertised record is never
+     * stale for more than a few minutes, self-healing without needing to
+     * implement the full DNSServiceRegister async-callback/event-loop
+     * machinery this codebase doesn't otherwise use anywhere.
+     */
+    unregister_dnssd();
+    register_dnssd();
+    return TRUE;
+}
+
 #define MAX_VIDEO_RENDERERS 3
 #define MAX_AUDIO_RENDERERS 2
 static void main_loop()  {
@@ -1007,6 +1037,7 @@ static void main_loop()  {
     missed_feedback = 0;
     guint feedback_watch_id = g_timeout_add_seconds(1, (GSourceFunc) feedback_callback, (gpointer) loop);
     guint reset_watch_id = g_timeout_add(100, (GSourceFunc) reset_callback, (gpointer) loop);
+    guint dnssd_refresh_watch_id = g_timeout_add_seconds(300, (GSourceFunc) dnssd_refresh_callback, (gpointer) loop);
 
 #ifdef _WIN32
     gmainloop = loop;
@@ -1042,6 +1073,7 @@ static void main_loop()  {
     if (progress_id > 0) g_source_remove(progress_id);
     if (video_eos_watch_id > 0) g_source_remove(video_eos_watch_id);
     if (feedback_watch_id > 0) g_source_remove(feedback_watch_id);
+    if (dnssd_refresh_watch_id > 0) g_source_remove(dnssd_refresh_watch_id);
     g_main_loop_unref(loop);
 }    
 
@@ -2474,17 +2506,24 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
     case RESET_TYPE_RTP_SHUTDOWN:
         LOGD("video_reset: type = RTP_Shutdown");
         if (use_video) {
-            if (!hls_support && !preserve_connections) {
-                /* Plain mirror-mode reconnect: leave the pipeline running
-                 * instead of stopping it, so the post-main_loop block below
-                 * doesn't need to destroy+recreate it (see skip_video_rebuild
-                 * comment above). The next connection's frames (primed with
-                 * fresh SPS/PPS by raop_rtp_mirror.c, same as any format
-                 * change mid-stream) resume decoding normally. */
-                skip_video_rebuild = true;
-            } else {
-                video_renderer_stop();
-            }
+            /* Previously: plain mirror-mode reconnects (!hls_support &&
+             * !preserve_connections) set skip_video_rebuild=true and left
+             * the pipeline running untouched instead of stopping it, to
+             * make a quick reconnect cheap (no destroy+recreate). That
+             * fast path meant an explicit "Stop Mirroring" click on the
+             * client -- which reaches this exact case via
+             * raop_handler_teardown() -- never called video_renderer_stop()
+             * or video_renderer_destroy() at all, leaving the last
+             * mirrored frame (potentially sensitive) on the physical
+             * display indefinitely with the pipeline still holding DRM
+             * master, confirmed as a real information-disclosure bug.
+             * This project's own stated design priority (see README) is
+             * "latency doesn't matter... audio/video sync does" -- the
+             * reconnect-latency optimization this skipped isn't something
+             * this deployment needs, so always stop (and let it rebuild
+             * via the normal post-main_loop path) rather than leave stale
+             * content on screen. */
+            video_renderer_stop();
         }
         remote_clock_offset = 0;
         relaunch_video = true;
