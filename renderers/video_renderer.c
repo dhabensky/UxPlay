@@ -828,6 +828,18 @@ static void video_renderer_blank_display() {
     }
     gst_object_unref(bus);
     gst_element_set_state(blank, GST_STATE_NULL);
+    /* Block until this throwaway pipeline has ACTUALLY finished releasing
+     * DRM master before returning -- gst_element_set_state() only
+     * requests the transition, it doesn't wait for it to complete, and
+     * kmssink's master release isn't guaranteed instantaneous. Without
+     * this wait, the real pipeline for the next connection (built very
+     * shortly after this function returns, via video_renderer_init() in
+     * uxplay.cpp's post-main_loop relaunch block) can start trying to
+     * grab DRM master while this one is still asynchronously releasing
+     * it -- confirmed as a real regression: video stopped playing after
+     * any re-mirror once this blanking step was added, exactly the
+     * signature of a lost DRM-master race. */
+    gst_element_get_state(blank, NULL, NULL, 2 * GST_SECOND);
     gst_object_unref(blank);
 }
 
@@ -839,12 +851,15 @@ void video_renderer_stop() {
         }
         gst_element_set_state (renderer->pipeline, GST_STATE_NULL);
         //gst_element_set_state (renderer->playbin, GST_STATE_NULL);
-        /* Block until DRM master is actually released before the
-         * blanking pipeline below tries to grab it -- kmssink requires
-         * exclusive master access on this hardware (same constraint that
-         * requires masking getty@tty1.service). */
-        gst_element_get_state(renderer->pipeline, NULL, NULL, 2 * GST_SECOND);
-        video_renderer_blank_display();
+        /* Deliberately NOT blanking the display here (unlike
+         * video_renderer_destroy() below) -- every real caller of this
+         * function is followed, shortly after, by video_renderer_destroy()
+         * (either immediately within the same video_reset() call, e.g.
+         * RESET_TYPE_HLS_EOS, or via main_loop()'s post-loop relaunch
+         * block once relaunch_video is set, e.g. RESET_TYPE_RTP_SHUTDOWN).
+         * Blanking in both places doubled the DRM-master grab/release
+         * race window for no benefit -- destroy() alone already covers
+         * every real teardown path exactly once. */
      }
 }
 
