@@ -342,12 +342,19 @@ void install_av_sync_probe(GstElement *pipeline) {
     gst_iterator_free(it);
 }
 
+static void video_renderer_join_pending_blank(void);
+
 void video_renderer_init(logger_t *render_logger, const char *server_name, videoflip_t videoflip[2], const char *parser, const char * rtp_pipeline,
                           const char *decoder, const char *converter, const char *videosink, const char *videosink_options, 
                           bool initial_fullscreen, bool video_sync, bool h265_support, bool coverart_support, guint playbin_version, const char *uri) {
     GError *error = NULL;
     GstCaps *caps = NULL;
     bool rtp = (bool) strlen(rtp_pipeline);
+    /* Wait for any async display-blank from a just-torn-down previous
+     * renderer to finish releasing DRM master before this new pipeline
+     * tries to acquire it -- see video_renderer_join_pending_blank()'s
+     * own comment for why the blank runs on a separate thread at all. */
+    video_renderer_join_pending_blank();
     g_atomic_int_set(&video_renderer_ready, 0);
     hls_video = (uri != NULL);
     /* videosink choices that are auto */
@@ -788,6 +795,40 @@ void video_renderer_hls_ready() {
     }
 }
 
+static GThread *g_blank_display_thread = NULL;
+
+/* video_renderer_destroy() runs on the same thread as main_loop()'s
+ * GMainLoop, which also services time-sensitive RTSP/RTCP protocol
+ * timers (e.g. feedback_callback's -reset N second client-silence
+ * check). video_renderer_blank_display() blocks for up to ~4s in the
+ * worst case (2s waiting for the blank pipeline to reach PLAYING/EOS,
+ * another 2s waiting for it to reach NULL) -- calling it synchronously
+ * stalled that thread long enough to trip the client-silence timeout,
+ * which triggered ANOTHER reconnect, which triggered ANOTHER blocking
+ * blank call: a self-sustaining reconnect storm, confirmed on the real
+ * device (rapid connect/disconnect cycling, "3 seconds since last
+ * client feedback" warnings, immediately after this blanking fix was
+ * deployed). Run it on its own thread instead so it can't stall
+ * anything else. video_renderer_init() joins any pending blank thread
+ * before proceeding (see there) so this doesn't reopen the DRM-master
+ * race the synchronous wait was originally added to close -- the
+ * asynchrony is only with respect to OTHER work (protocol timers),
+ * never with respect to the next pipeline actually being built. */
+static void video_renderer_join_pending_blank(void) {
+    if (g_blank_display_thread) {
+        g_thread_join(g_blank_display_thread);
+        g_blank_display_thread = NULL;
+    }
+}
+
+static void video_renderer_blank_display(void);
+
+static gpointer video_renderer_blank_display_thread_func(gpointer data) {
+    (void) data;
+    video_renderer_blank_display();
+    return NULL;
+}
+
 static void video_renderer_blank_display() {
     /* Setting the main pipeline to GST_STATE_NULL below stops it from
      * pushing new frames and releases DRM master, but that does NOT
@@ -981,7 +1022,8 @@ void video_renderer_destroy() {
      * rebuild/reconnect hiccup there is an acceptable trade-off against
      * ever leaving stale content on screen indefinitely.
      */
-    video_renderer_blank_display();
+    video_renderer_join_pending_blank(); /* in case an earlier one is still running */
+    g_blank_display_thread = g_thread_new("video-blank", video_renderer_blank_display_thread_func, NULL);
 }
 
 static void get_stream_status_name(GstStreamStatusType type, char *name, size_t len) {
