@@ -41,6 +41,12 @@ DNSSD_API int dnssd_register_airplay(dnssd_t *dnssd, unsigned short port);
 DNSSD_API void dnssd_unregister_raop(dnssd_t *dnssd);
 DNSSD_API void dnssd_unregister_airplay(dnssd_t *dnssd);
 
+/* Safe for periodic use (unlike unregister_raop/airplay + register_raop/airplay
+ * again, which frees dnssd->name/hw_addr as a side effect once both services
+ * are unregistered -- fine when immediately followed by dnssd_destroy(), a
+ * real use-after-free otherwise). See dnssd.c for the full story. */
+DNSSD_API int dnssd_reregister(dnssd_t *dnssd, unsigned short raop_port, unsigned short airplay_port);
+
 DNSSD_API const char *dnssd_get_raop_txt(dnssd_t *dnssd, int *length);
 DNSSD_API const char *dnssd_get_airplay_txt(dnssd_t *dnssd, int *length);
 DNSSD_API const char *dnssd_get_name(dnssd_t *dnssd, int *length);

@@ -925,9 +925,6 @@ static gboolean video_eos_watch_callback (gpointer loop) {
     return TRUE;
 }
 
-static int register_dnssd();
-static void unregister_dnssd();
-
 static gboolean dnssd_refresh_callback (gpointer loop) {
     /* Periodically re-publish the mDNS/DNS-SD records instead of only
      * ever registering once at startup. Root cause of a real, recurring
@@ -949,9 +946,17 @@ static gboolean dnssd_refresh_callback (gpointer loop) {
      * stale for more than a few minutes, self-healing without needing to
      * implement the full DNSServiceRegister async-callback/event-loop
      * machinery this codebase doesn't otherwise use anywhere.
+     *
+     * Uses dnssd_reregister(), NOT unregister_dnssd()+register_dnssd() --
+     * that combination was tried first and caused a severe regression:
+     * unregister_dnssd() frees dnssd->name/hw_addr once both services are
+     * unregistered (fine when followed by dnssd_destroy(), a real
+     * use-after-free when followed by registering again moments later).
+     * That corrupted the heap and crashed the whole process with SIGABRT
+     * every 5 minutes on the live device (confirmed via systemd's restart
+     * counter climbing continuously) until caught and fixed here.
      */
-    unregister_dnssd();
-    register_dnssd();
+    dnssd_reregister(dnssd, raop_port, airplay_port);
     return TRUE;
 }
 

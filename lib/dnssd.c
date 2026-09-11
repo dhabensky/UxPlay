@@ -479,6 +479,40 @@ dnssd_unregister_airplay(dnssd_t *dnssd)
     }
 }
 
+int
+dnssd_reregister(dnssd_t *dnssd, unsigned short raop_port, unsigned short airplay_port)
+{
+    /* Same deallocation as dnssd_unregister_raop/airplay above, MINUS the
+     * free(dnssd->name)/free(dnssd->hw_addr) side effect those do once
+     * both services are unregistered. That free is safe for every existing
+     * caller (dnssd_unregister_raop/airplay are only ever called from
+     * uxplay.cpp's unregister_dnssd(), always immediately followed by
+     * dnssd_destroy()) but NOT safe here: this function re-registers
+     * immediately afterward, and dnssd_register_raop/airplay both read
+     * dnssd->name/hw_addr to build the service name. Calling the existing
+     * unregister-then-register sequence for a periodic refresh (added to
+     * recover from avahi dropping externally-registered records on
+     * interface churn, e.g. a routine DHCP renewal) freed those fields
+     * then used them again moments later -- a real use-after-free that
+     * corrupted the heap and crashed the whole process with SIGABRT every
+     * ~5 minutes on the live device, confirmed via systemd's restart
+     * counter climbing continuously. */
+    assert(dnssd);
+    if (dnssd->raop_service) {
+        dnssd->TXTRecordDeallocate(&dnssd->raop_record);
+        dnssd->DNSServiceRefDeallocate(dnssd->raop_service);
+        dnssd->raop_service = NULL;
+    }
+    if (dnssd->airplay_service) {
+        dnssd->TXTRecordDeallocate(&dnssd->airplay_record);
+        dnssd->DNSServiceRefDeallocate(dnssd->airplay_service);
+        dnssd->airplay_service = NULL;
+    }
+    int err = dnssd_register_raop(dnssd, raop_port);
+    if (err) return err;
+    return dnssd_register_airplay(dnssd, airplay_port);
+}
+
 uint64_t dnssd_get_airplay_features(dnssd_t *dnssd) {
     uint64_t features = ((uint64_t) dnssd->features2) << 32;
     features += (uint64_t) dnssd->features1;
