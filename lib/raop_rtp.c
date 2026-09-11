@@ -251,8 +251,8 @@ raop_rtp_init_sockets(raop_rtp_t *raop_rtp, int use_ipv6)
     /* Set port values */
     raop_rtp->control_lport = cport;
     raop_rtp->data_lport = dport;
-    logger_log(raop_rtp->logger, LOGGER_DEBUG, "raop_rtp local control port socket %d port UDP %d", csock, cport);
-    logger_log(raop_rtp->logger, LOGGER_DEBUG, "raop_rtp local data port    socket %d port UDP %d", dsock, dport);
+    logger_log(raop_rtp->logger, LOGGER_INFO, "raop_rtp local control port socket %d port UDP %d", csock, cport);
+    logger_log(raop_rtp->logger, LOGGER_INFO, "raop_rtp local data port    socket %d port UDP %d", dsock, dport);
     return 0;
 
     sockets_cleanup:
@@ -662,6 +662,20 @@ raop_rtp_start_audio(raop_rtp_t *raop_rtp,  unsigned short *control_rport, unsig
 
     MUTEX_LOCK(raop_rtp->run_mutex);
     if (raop_rtp->running || !raop_rtp->joined) {
+        /* Redundant SETUP for a stream that's already active (observed in
+         * practice: a real AirPlay client issuing the audio SETUP request
+         * more than once in one session). Report the ports it's ALREADY
+         * bound to instead of leaving the caller's out-params untouched --
+         * otherwise the SETUP response echoes back the caller's own
+         * zero-initialized default (raop->control_lport/data_lport are 0
+         * unless "-p" was passed), telling the client to send audio RTP to
+         * port 0. If the client trusts the last SETUP response it gets
+         * (which a redundant one is), that silently breaks audio playback
+         * with no error anywhere -- confirmed on the wire: only the NTP
+         * timing heartbeat was seen, zero real audio RTP packets.
+         */
+        *control_lport = raop_rtp->control_lport;
+        *data_lport = raop_rtp->data_lport;
         MUTEX_UNLOCK(raop_rtp->run_mutex);
         return;
     }
