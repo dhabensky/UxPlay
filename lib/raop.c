@@ -302,21 +302,24 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
             if (raop_conn) {
                 raop_rtp_mirror_t *raop_rtp_mirror = raop_conn->raop_rtp_mirror;
                 if (raop_rtp_mirror) {
-                    logger_log(raop->logger, LOGGER_DEBUG, "New AirPlay connection: stopping RAOP mirror"
+                    logger_log(raop->logger, LOGGER_INFO, "New AirPlay connection: stopping RAOP mirror"
                                " service on RAOP connection %p", raop_conn);
                     raop_rtp_mirror_stop(raop_rtp_mirror);
                 }
 
                 raop_rtp_t *raop_rtp = raop_conn->raop_rtp;
                 if (raop_rtp) {
-                    logger_log(raop->logger, LOGGER_DEBUG, "New AirPlay connection: stopping RAOP audio"
-                               " service on RAOP connection %p", raop_conn);
+                    logger_log(raop->logger, LOGGER_INFO, "New AirPlay connection: stopping RAOP audio"
+                               " service on RAOP connection %p (this closes the just-negotiated audio"
+                               " UDP sockets -- if this fires right after an AUDIO SETUP response, the"
+                               " client was told a port that's already been torn down by the time it"
+                               " sends anything there)", raop_conn);
                     raop_rtp_stop(raop_rtp);
                 }
 
                 raop_ntp_t *raop_ntp = raop_conn->raop_ntp;
                 if (raop_rtp) {
-                    logger_log(raop->logger, LOGGER_DEBUG, "New AirPlay connection: stopping NTP time"
+                    logger_log(raop->logger, LOGGER_INFO, "New AirPlay connection: stopping NTP time"
                                " service on RAOP connection %p", raop_conn);
                     raop_ntp_stop(raop_ntp);
                 }

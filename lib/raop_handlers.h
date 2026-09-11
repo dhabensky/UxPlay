@@ -1035,6 +1035,8 @@ raop_handler_setup(raop_conn_t *conn,
                     http_response_set_disconnect(response, 1);
                 }
 
+                logger_log(raop->logger, LOGGER_INFO, "AUDIO SETUP response: dataPort=%u controlPort=%u remote_cport=%u ct=%u sr=%u",
+                           dport, cport, remote_cport, (unsigned) ct, sr);
                 plist_t res_stream_node = plist_new_dict();
                 plist_t res_stream_data_port_node = plist_new_uint(dport);
                 plist_t res_stream_control_port_node = plist_new_uint(cport);
