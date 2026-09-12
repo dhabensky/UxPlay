@@ -908,43 +908,6 @@ static void video_renderer_blank_display() {
     gst_object_unref(blank);
 }
 
-/* Public, synchronous entry point for blanking the display OUTSIDE the
- * disconnect path -- specifically for process startup, before video_renderer_init()
- * has ever been called (must run strictly before it, not merely before
- * video_renderer_start()'s PAUSED transition: confirmed on real hardware that
- * video_renderer_init() itself already drives the h264 pipeline's kmssink far
- * enough to claim its overlay plane -- "kmssink_h264 ... gst_kms_sink_start:
- * connector id = 35 / crtc id = 97 / plane id = 98" appears in the log well
- * before video_renderer_start() ever runs. With that plane already claimed,
- * this function's own force-modesetting grab for the primary plane fails --
- * "Failed to set mode: Permission denied" -- because a modeset needs DRM
- * master and another kmssink instance on the same connector/CRTC already
- * holds it. Calling this first, before any renderer pipeline object exists
- * in the process at all, avoids the conflict entirely). Takes the logger
- * explicitly and sets the module's `logger` global itself (video_renderer_init(),
- * which normally does this, hasn't run yet) -- calling video_renderer_blank_display()
- * with a NULL logger segfaults inside logger_log() (confirmed via gdb: SIGSEGV
- * in pthread_mutex_lock, called from logger_log(), called from
- * video_renderer_blank_display()).
- *
- * The DRM primary plane (fbcon) still holds whatever was last painted there
- * at boot (the kernel/systemd console log) until something else claims and
- * repaints it; kmssink's main pipeline moves to an overlay plane rather than
- * the primary one (see the force-modesetting removal -- 2026-09-11,
- * PROGRESS.md), so without this the boot log stays visible in whatever
- * screen area a session's video doesn't cover (e.g. pillarbox margins for
- * non-16:9 source content). Reuses the exact same "paint one black frame on
- * the primary plane via force-modesetting, then release" mechanism already
- * used for the frozen-last-frame-after-disconnect fix. Safe to call
- * synchronously here (unlike the disconnect path): this runs before
- * main_loop() ever starts, so there's no protocol timer thread it could
- * stall. */
-void video_renderer_blank_display_now(logger_t *render_logger) {
-    logger = render_logger;
-    video_renderer_join_pending_blank(); /* in case one's already running */
-    video_renderer_blank_display();
-}
-
 void video_renderer_stop() {
     if (renderer) {
         logger_log(logger, LOGGER_DEBUG,"video_renderer_stop");

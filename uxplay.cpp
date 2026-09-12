@@ -3493,23 +3493,6 @@ int main (int argc, char *argv[]) {
         LOGI("audio_disabled");
     }
     if (use_video) {
-        /* Clear the DRM primary plane's stale boot-console content before
-         * video_renderer_init() below ever runs -- otherwise it stays
-         * visible (e.g. in pillarbox margins) for however long the device
-         * has been up. Must run strictly BEFORE video_renderer_init(), not
-         * merely before video_renderer_start(): confirmed on real hardware
-         * that video_renderer_init() itself already drives the h264
-         * pipeline's kmssink far enough to claim its overlay plane (visible
-         * in the log well before video_renderer_start() runs), and once
-         * that plane is claimed, this call's own force-modesetting grab for
-         * the primary plane fails with "Permission denied" (another kmssink
-         * instance on the same connector/CRTC already holds DRM master).
-         * Calling this first, before any renderer pipeline object exists in
-         * the process at all, avoids that conflict entirely -- see
-         * video_renderer_blank_display_now()'s own comment for the full
-         * story, including the earlier NULL-logger crash this ordering also
-         * has to avoid. */
-        video_renderer_blank_display_now(render_logger);
         video_renderer_init(render_logger, server_name.c_str(), videoflip, video_parser.c_str(), rtp_pipeline.c_str(),
                             video_decoder.c_str(), video_converter.c_str(), videosink.c_str(),
                             videosink_options.c_str(), fullscreen, video_sync, h265_support,
