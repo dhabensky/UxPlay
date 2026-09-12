@@ -45,6 +45,7 @@
 #else
 #include <csignal>
 #include <glib-unix.h>
+#include <gio/gio.h>  /* GFileMonitor for the live overscan-config reload, see main_loop() */
 #include <sys/utsname.h>
 #include <sys/socket.h>
 #include <ifaddrs.h>
@@ -883,6 +884,23 @@ static gboolean sighup_callback(gpointer loop) {
     g_main_loop_quit((GMainLoop *) loop);
     return TRUE;
 }
+
+/* Live overscan-config reload: fires on every raw filesystem event GIO sees
+ * for /etc/default/uxplay, but only actually re-applies on
+ * G_FILE_MONITOR_EVENT_CHANGES_DONE_HINT -- GIO's own debounced "a burst of
+ * changes has now settled" event, which is exactly what a text editor's
+ * save produces (usually 2-3 raw events: e.g. a CREATED temp file, then a
+ * RENAMED/MOVED over the original). Reacting to every raw event instead
+ * would risk re-applying mid-write, and would redundantly re-apply the same
+ * value multiple times per save. */
+static void overscan_config_changed_cb(GFileMonitor *monitor, GFile *file, GFile *other_file,
+                                        GFileMonitorEvent event_type, gpointer user_data) {
+    (void) monitor; (void) file; (void) other_file; (void) user_data;
+    LOGD("overscan config monitor: event_type=%d", (int) event_type);
+    if (event_type == G_FILE_MONITOR_EVENT_CHANGES_DONE_HINT) {
+        video_renderer_apply_overscan();
+    }
+}
 #endif
 
 static void display_progress(uint32_t start, uint32_t curr, uint32_t end) {
@@ -1026,6 +1044,21 @@ static void main_loop()  {
     guint sigterm_watch_id = g_unix_signal_add(SIGTERM, (GSourceFunc) sigterm_callback, (gpointer) loop);
     guint sigint_watch_id = g_unix_signal_add(SIGINT, (GSourceFunc) sigint_callback, (gpointer) loop);
     guint sighup_watch_id = g_unix_signal_add(SIGHUP, (GSourceFunc) sigint_callback, (gpointer) loop);
+    /* Registered once here, for the whole process lifetime (main_loop() is
+     * only ever called once from main(), not per-connection -- confirmed
+     * this session) rather than per-client, so overscan is tunable live
+     * whether or not anyone is currently mirroring. */
+    GFile *overscan_conf_file = g_file_new_for_path("/etc/default/uxplay");
+    GError *overscan_monitor_error = NULL;
+    GFileMonitor *overscan_conf_monitor = g_file_monitor_file(overscan_conf_file, G_FILE_MONITOR_NONE, NULL, &overscan_monitor_error);
+    if (overscan_conf_monitor) {
+        g_signal_connect(overscan_conf_monitor, "changed", G_CALLBACK(overscan_config_changed_cb), NULL);
+        LOGI("overscan config monitor registered on /etc/default/uxplay");
+    } else {
+        LOGE("overscan config monitor registration FAILED: %s",
+             overscan_monitor_error ? overscan_monitor_error->message : "(no error message)");
+        if (overscan_monitor_error) g_error_free(overscan_monitor_error);
+    }
 #endif
     g_main_loop_run(loop);
 
@@ -1038,6 +1071,11 @@ static void main_loop()  {
     if (sigint_watch_id > 0) g_source_remove(sigint_watch_id);
     if (sigterm_watch_id > 0) g_source_remove(sigterm_watch_id);
     if (sighup_watch_id > 0) g_source_remove(sighup_watch_id);
+    if (overscan_conf_monitor) {
+        g_file_monitor_cancel(overscan_conf_monitor);
+        g_object_unref(overscan_conf_monitor);
+    }
+    g_object_unref(overscan_conf_file);
 #endif
 
     for (int i = 0; i < n_video_renderers; i++) {
@@ -3498,6 +3536,12 @@ int main (int argc, char *argv[]) {
                             videosink_options.c_str(), fullscreen, video_sync, h265_support,
                             render_coverart, playbin_version, NULL);
         video_renderer_start();
+        /* Apply whatever /etc/default/uxplay currently says before any
+         * client ever connects -- see video_renderer_apply_overscan()'s own
+         * comment. main_loop() (below) additionally watches this file for
+         * later live edits, so this startup call only covers the window
+         * before that watch is registered. */
+        video_renderer_apply_overscan();
 #ifdef __OpenBSD__
     } else {
         if (pledge("stdio rpath wpath cpath inet unix prot_exec", NULL) == -1) {
