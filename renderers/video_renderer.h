@@ -68,6 +68,7 @@ void video_renderer_display_jpeg(const void *data, int *data_len);
 void video_renderer_flush ();
 unsigned int video_renderer_listen(void *loop, int id);
 void video_renderer_destroy ();
+void video_renderer_blank_display_now (logger_t *render_logger);
 void video_renderer_size(float *width_source, float *height_source, float *width, float *height);
 bool waiting_for_x11_window();
 bool video_get_playback_info(double *duration, double *position, double *seek_start, double *seek_duration, float *rate, bool *buffer_empty, bool *buffer_full);
