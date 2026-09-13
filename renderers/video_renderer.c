@@ -23,7 +23,6 @@
 #include <stdio.h>
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
-#include <gst/video/videooverlay.h>
 #include "video_renderer.h"
 
 #define SECOND_IN_NSECS 1000000000UL
@@ -681,59 +680,20 @@ static void read_overscan_conf(int *left, int *right, int *top, int *bottom) {
     fclose(f);
 }
 
-/* Applies a "<x,y,w,h>" render-rectangle string to every live mirror-mode
- * kmssink, live -- no pipeline rebuild, no dropped connection. render-rectangle
- * is a plain GObject property on kmssink, and GStreamer supports changing it
- * on a running pipeline -- confirmed live via GST_DEBUG ("Setting render
- * rectangle to ..."). Shared by video_renderer_apply_overscan() (the real,
- * config-computed rectangle) and video_renderer_hide_video() (a degenerate
- * rectangle, to hide whatever's currently showing without touching pipeline
- * state at all). */
-static void apply_render_rectangle(const char *rect) {
+/* Applies OVERSCAN_CONF_PATH's current margins to every live mirror-mode
+ * kmssink, live -- no pipeline rebuild, no dropped connection. Safe to call
+ * at any time: once at startup (right after video_renderer_start(), see
+ * uxplay.cpp) and again every time the config file changes (see the
+ * GFileMonitor set up in uxplay.cpp's main_loop()). render-rectangle is a
+ * plain GObject property on kmssink, and GStreamer supports changing it on
+ * a running pipeline -- confirmed live earlier this session via GST_DEBUG
+ * ("Setting render rectangle to ..."). The margin itself renders as solid
+ * black because the DRM primary plane underneath is kept zeroed
+ * (/usr/local/bin/zero-fb0), not because anything here paints it. */
+void video_renderer_apply_overscan(void) {
     if (hls_video || !g_videosink_name) {
         return; /* HLS playback doesn't build per-codec named kmssink elements this targets */
     }
-    for (int i = 0; i < n_renderers; i++) {
-        if (!renderer_type[i] || !renderer_type[i]->pipeline || !renderer_type[i]->codec) {
-            continue;
-        }
-        char name[64];
-        snprintf(name, sizeof(name), "%s_%s", g_videosink_name, renderer_type[i]->codec);
-        GstElement *sink = gst_bin_get_by_name(GST_BIN(renderer_type[i]->pipeline), name);
-        if (!sink) {
-            continue;
-        }
-        if (g_object_class_find_property(G_OBJECT_GET_CLASS(sink), "render-rectangle")) {
-            gst_util_set_object_arg(G_OBJECT(sink), "render-rectangle", rect);
-            /* Setting the property alone only changes kmssink's internal
-             * GObject state -- it re-commits the DRM plane's actual on-screen
-             * geometry only the next time it renders a buffer (confirmed via
-             * tools/drmdump.c). With no client connected (the case
-             * video_renderer_hide_video() below matters for), no new buffers
-             * ever arrive, so the old geometry would stay visually active
-             * indefinitely without this: expose() (standard GstVideoOverlay
-             * interface) re-renders the last held buffer against whatever
-             * render-rectangle is currently set, no new buffer needed. */
-            if (GST_IS_VIDEO_OVERLAY(sink)) {
-                gst_video_overlay_expose(GST_VIDEO_OVERLAY(sink));
-            }
-            logger_log(logger, LOGGER_INFO, "video renderer: set %s render-rectangle to %s", name, rect);
-        }
-        gst_object_unref(sink);
-    }
-}
-
-/* Applies OVERSCAN_CONF_PATH's current margins to every live mirror-mode
- * kmssink. Safe to call at any time: once at startup (right after
- * video_renderer_start(), see uxplay.cpp), again every time the config file
- * changes (see the GFileMonitor set up in uxplay.cpp's main_loop()), and
- * again whenever a new connection actually starts decoding (see
- * video_renderer_choose_codec() below) -- the last of these is what restores
- * the real picture after video_renderer_hide_video() hid it for a previous
- * client's disconnect. The margin itself renders as solid black because the
- * DRM primary plane underneath is kept zeroed (/usr/local/bin/zero-fb0), not
- * because anything here paints it. */
-void video_renderer_apply_overscan(void) {
     int left, right, top, bottom;
     read_overscan_conf(&left, &right, &top, &bottom);
 
@@ -750,45 +710,23 @@ void video_renderer_apply_overscan(void) {
 
     char rect[64];
     snprintf(rect, sizeof(rect), "<%d,%d,%d,%d>", left, top, w, h);
-    apply_render_rectangle(rect);
-}
 
-/* Hides whatever the currently-live kmssink(s) are showing, WITHOUT touching
- * pipeline state (no stop/destroy/rebuild) -- fixes the frozen-last-frame-
- * after-disconnect bug (2026-09-12) without reopening the re-mirror
- * regression an earlier fix attempt caused (see uxplay.cpp's
- * RESET_TYPE_RTP_SHUTDOWN handling: the pipeline is deliberately kept alive
- * across a plain disconnect for fast reconnect, so blanking has to happen
- * without tearing anything down). Confirmed empirically that a real
- * disconnect otherwise leaves the overlay plane showing the last decoded
- * frame indefinitely, with correct destination geometry and everything --
- * kmssink has no idea the client went away, it just has nothing new to draw.
- *
- * A first attempt used a degenerate "<0,0,1,1>" (1x1) render-rectangle --
- * confirmed via tools/drmdump.c to NOT work, root-caused by reading
- * gst_kms_sink_show_frame()'s actual source (gst-plugins-bad's
- * sys/kms/gstkmssink.c): it computes the on-screen dest rect via
- * gst_video_sink_center_rect() (aspect-preserving fit of the source into our
- * render-rectangle's w/h), and if EITHER resulting dimension rounds down to
- * <= 0 -- as it does when fitting a ~1920x1080 source into a literal 1x1 box
- * -- it logs "video is out of display range" and jumps straight past
- * drmModeSetPlane entirely, leaving whatever was already on screen untouched.
- * That silent no-op is exactly what every prior "expose() doesn't work"
- * observation was actually seeing.
- *
- * Fix: use a full-size rectangle (so the aspect-preserving fit is always
- * comfortably >0 in both dimensions, same as any normal overscan rectangle)
- * but positioned with a large negative X so it's entirely off the left edge
- * of the screen. Confirmed from the same source that the only clamp applied
- * is for OVERFLOW past the right/bottom edge (x+w > hdisplay / y+h >
- * vdisplay); there's no equivalent clamp for a negative x, so the width
- * survives unclamped and the plane just paints somewhere the CRTC can't see
- * it. video_renderer_choose_codec() restores the real on-screen rectangle
- * the moment a new connection actually starts decoding. */
-void video_renderer_hide_video(void) {
-    char rect[64];
-    snprintf(rect, sizeof(rect), "<%d,%d,%d,%d>", -OVERSCAN_SCREEN_W, 0, OVERSCAN_SCREEN_W, OVERSCAN_SCREEN_H);
-    apply_render_rectangle(rect);
+    for (int i = 0; i < n_renderers; i++) {
+        if (!renderer_type[i] || !renderer_type[i]->pipeline || !renderer_type[i]->codec) {
+            continue;
+        }
+        char name[64];
+        snprintf(name, sizeof(name), "%s_%s", g_videosink_name, renderer_type[i]->codec);
+        GstElement *sink = gst_bin_get_by_name(GST_BIN(renderer_type[i]->pipeline), name);
+        if (!sink) {
+            continue;
+        }
+        if (g_object_class_find_property(G_OBJECT_GET_CLASS(sink), "render-rectangle")) {
+            gst_util_set_object_arg(G_OBJECT(sink), "render-rectangle", rect);
+            logger_log(logger, LOGGER_INFO, "overscan: set %s render-rectangle to %s", name, rect);
+        }
+        gst_object_unref(sink);
+    }
 }
 
 /* used to find any X11 Window used by the playbin (HLS) pipeline after it starts playing.
@@ -1488,12 +1426,6 @@ int video_renderer_choose_codec (bool video_is_jpeg, bool video_is_h265) {
     /* refresh base_time (it changes if the pipeline was restarted from NULL after
      * a reconnect) so the ntp->pts mapping stays correct. */
     gst_video_pipeline_base_time = gst_element_get_base_time(renderer_used->appsrc);
-    /* A new connection is actually about to decode real video -- restore the
-     * real overscan-computed picture in case a previous client's disconnect
-     * left it hidden (see video_renderer_hide_video()). Unconditional and
-     * idempotent (a plain property set), so it's harmless to also run this
-     * on a same-codec reconnect that never actually needed hiding. */
-    video_renderer_apply_overscan();
     if (renderer_used == renderer) {
         return 0;   /* was already the active renderer (now re-confirmed PLAYING) */
     }

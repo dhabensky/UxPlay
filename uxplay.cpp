@@ -211,14 +211,7 @@ static uint64_t remote_clock_offset = 0;
  *                        reconnect (video_renderer_stop -> destroy -> init ->
  *                        start), recreating the pipeline+kmssink; or
  *                        "stop": keep the pipeline, just stop it and let
- *                        choose_codec restart it (reuses the same kmssink);
- *                        or "real": call the actual production
- *                        video_reset(RESET_TYPE_RTP_SHUTDOWN) and replicate
- *                        the real post-main_loop skip_video_rebuild check.
- *   UX_RECONNECT_PAUSE_MS = only for mode=real: sleep this many ms between
- *                        the disconnect and reconnect halves, so an external
- *                        tool (e.g. tools/drmdump.c) can inspect on-screen
- *                        state during a window that's normally instantaneous.
+ *                        choose_codec restart it (reuses the same kmssink).
  * Both then run choose_codec + audio_renderer_start, as a fresh client does.
  * Definition is below the option globals it needs; forward-declared here. */
 static void replay_do_reconnect(unsigned char ct);
@@ -439,9 +432,6 @@ static void replay_do_reconnect(unsigned char ct) {
     if (real) {
         /* Exercise the actual production reconnect path. */
         video_reset(NULL, RESET_TYPE_RTP_SHUTDOWN);
-        /* See UX_RECONNECT_PAUSE_MS in the doc comment above. */
-        { const char *pause_ms = g_getenv("UX_RECONNECT_PAUSE_MS");
-          if (pause_ms) { int ms = atoi(pause_ms); if (ms > 0) { fprintf(stderr, "replay: pausing %dms post-disconnect before reconnect\n", ms); usleep((useconds_t) ms * 1000); } } }
         if (use_audio) audio_renderer_stop();
         if (use_video && !skip_video_rebuild) {
             video_renderer_destroy();
@@ -2521,23 +2511,8 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
                  * since it never sets it) still reaches
                  * video_renderer_destroy()'s blanking call within N seconds
                  * of a real disconnect, whether or not the client sent an
-                 * explicit TEARDOWN first.
-                 *
-                 * 2026-09-12: that N-second wait was a real, user-visible
-                 * bug (reported directly: "last frame stays, should be
-                 * black") -- confirmed empirically via a real disconnect +
-                 * drmdump that the overlay plane shows the frozen last frame
-                 * with fully correct destination geometry the whole time,
-                 * since kmssink has no idea the client went away, it just
-                 * has nothing new to draw. Fixed WITHOUT touching pipeline
-                 * state (the actual constraint this skip_video_rebuild path
-                 * exists for): video_renderer_hide_video() shrinks the live
-                 * kmssink's render-rectangle to a single pixel, live, same
-                 * mechanism as the overscan feature. video_renderer_choose_codec()
-                 * restores the real picture the moment a new connection
-                 * actually starts decoding. */
+                 * explicit TEARDOWN first. */
                 skip_video_rebuild = true;
-                video_renderer_hide_video();
             } else {
                 video_renderer_stop();
             }
