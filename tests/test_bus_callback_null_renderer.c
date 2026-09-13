@@ -29,6 +29,16 @@ void logger_log(logger_t *logger, int level, const char *fmt, ...) {
     va_end(ap);
 }
 
+/* Minimal stub: the real implementation lives in video_renderer.c, which
+ * this test has no reason to link against (2026-09-13: found while
+ * finally wiring this test into an actual build/runner for the first
+ * time -- see Dockerfile.unit-tests). Never actually invoked by this
+ * test (audio_renderer_init() itself is never called here), just needs
+ * to exist to satisfy the linker. */
+void install_av_sync_probe(GstElement *pipeline) {
+    (void) pipeline;
+}
+
 /* audio_renderer.c's `renderer` and gstreamer_audio_pipeline_bus_callback
  * are file-static; pull the translation unit in directly so we can call it. */
 #include "../renderers/audio_renderer.c"

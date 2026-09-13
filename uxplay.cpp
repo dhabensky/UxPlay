@@ -2903,7 +2903,14 @@ extern "C" void audio_get_format (void *cls, unsigned char *ct, unsigned short *
     
     if (do_capture) cap_write('C', NULL, 0, (uint64_t) *ct);
     if (use_audio) {
-      audio_renderer_start(ct);
+      /* Deferred to the main thread's GMainLoop (see
+       * audio_renderer_start_deferred()'s own comment in audio_renderer.c):
+       * audio_get_format() runs on the httpd thread (called inline from a
+       * SETUP request's handler), which used to call the synchronous
+       * audio_renderer_start() directly -- a real, unsynchronized race
+       * against the RAOP audio thread's own self-heal path touching the
+       * same renderer/pipeline state. */
+      audio_renderer_start_deferred(*ct);
     }
 
     if (mux_to_file) {
