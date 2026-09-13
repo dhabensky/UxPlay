@@ -312,6 +312,51 @@ void  audio_renderer_start(unsigned char *ct) {
     }
 }
 
+/* 2026-09-13: audio_renderer_start()/_stop() used to be called directly,
+ * with no lock, from two different threads -- the httpd thread (via
+ * audio_get_format(), a SETUP request's handler) and the RAOP audio
+ * thread (via audio_renderer_render_buffer()'s self-heal-on-push-failure
+ * path below), both writing the same `renderer` pointer and touching the
+ * same GStreamer pipeline state. See docs/audio-pipeline.md's
+ * "conn_request() finding" and bugs/2026-09-13-audio-dies-on-repeated-
+ * track-switch-setup.md for the full investigation. Fix: defer these two
+ * specific call sites onto the main thread's GMainLoop via g_idle_add(),
+ * the same pattern already used elsewhere in this project (the overscan
+ * GFileMonitor callback) -- serializes them without changing
+ * audio_renderer_start()/_stop()'s own synchronous behavior for every
+ * OTHER existing caller (audio_renderer_destroy() in particular relies
+ * on audio_renderer_stop() completing before it frees the very structures
+ * `renderer` points into -- deferring it universally would be a
+ * use-after-free once that freed memory is touched later). Packs the
+ * single `ct` byte directly into the gpointer via GUINT_TO_POINTER --
+ * no heap allocation needed for something this small. */
+static gboolean audio_renderer_deferred_start_cb(gpointer data) {
+    unsigned char ct = (unsigned char) GPOINTER_TO_UINT(data);
+    audio_renderer_start(&ct);
+    return G_SOURCE_REMOVE;
+}
+
+void audio_renderer_start_deferred(unsigned char compression_type) {
+    g_idle_add(audio_renderer_deferred_start_cb, GUINT_TO_POINTER((guint) compression_type));
+}
+
+/* The self-heal path needs stop()+start() to run as one atomic pair on
+ * the main thread (not two separate idle callbacks, which another thread
+ * could interleave between) -- and needs stop() to actually run (not be
+ * skipped) so audio_renderer_start()'s own "same format as current
+ * renderer -> no-op" branch doesn't swallow the restart, since the ct is
+ * unchanged across a self-heal. */
+static gboolean audio_renderer_deferred_self_heal_cb(gpointer data) {
+    unsigned char ct = (unsigned char) GPOINTER_TO_UINT(data);
+    audio_renderer_stop();
+    audio_renderer_start(&ct);
+    return G_SOURCE_REMOVE;
+}
+
+void audio_renderer_self_heal_deferred(unsigned char compression_type) {
+    g_idle_add(audio_renderer_deferred_self_heal_cb, GUINT_TO_POINTER((guint) compression_type));
+}
+
 void audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned short *seqnum, uint64_t *ntp_time) {
     GstBuffer *buffer = NULL;
 
@@ -391,9 +436,11 @@ void audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned s
              * on the user to notice and manually reconnect. */
             logger_log(logger, LOGGER_ERR, "*** ERROR gst_app_src_push_buffer failed, GstFlowReturn = %d (%s); restarting audio renderer",
                        ret, gst_flow_get_name(ret));
-            unsigned char ct = renderer->ct;
-            audio_renderer_stop();
-            audio_renderer_start(&ct);
+            /* Deferred (see audio_renderer_self_heal_deferred()'s own
+             * comment above): this runs on the RAOP audio thread, and the
+             * httpd thread can be calling audio_renderer_start() at the
+             * same moment for a concurrently-arriving SETUP request. */
+            audio_renderer_self_heal_deferred(renderer->ct);
         }
     } else {
         logger_log(logger, LOGGER_ERR, "*** ERROR invalid  audio frame (compression_type %d) skipped ", renderer->ct);

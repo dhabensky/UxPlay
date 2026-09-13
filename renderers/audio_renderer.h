@@ -36,6 +36,16 @@ bool gstreamer_init();
 void audio_renderer_init(logger_t *logger, const char* audiosink, const bool *audio_sync, const bool *video_sync, const char *artp_pipeline);
 void audio_renderer_start(unsigned char* compression_type);
 void audio_renderer_stop();
+/* Deferred variants of the above, run on the main thread's GMainLoop via
+ * g_idle_add() instead of inline on the calling thread -- see their
+ * definitions in audio_renderer.c for why (a real, unsynchronized
+ * cross-thread hazard between the httpd thread and the RAOP audio
+ * thread, both touching the same `renderer` pointer/pipeline state with
+ * no lock). Use these two specific call sites only; every other existing
+ * caller of audio_renderer_start()/audio_renderer_stop() keeps their
+ * original synchronous behavior unchanged. */
+void audio_renderer_start_deferred(unsigned char compression_type);
+void audio_renderer_self_heal_deferred(unsigned char compression_type);
 void audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned short *seqnum, uint64_t *ntp_time);
 void audio_renderer_set_volume(double volume);
 void audio_renderer_flush();
