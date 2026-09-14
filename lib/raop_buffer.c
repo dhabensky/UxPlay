@@ -33,7 +33,22 @@
 #include "utils.h"
 #include "byteutils.h"
 
+#include <time.h>
+
 #define RAOP_BUFFER_LENGTH 256
+
+/* raop_buffer_handle_resends() is called on every iteration of the RTP
+ * thread's select() loop (lib/raop_rtp.c) whenever real socket activity
+ * wakes it -- with no rate limiting, this fires a brand new duplicate
+ * resend request every single time a packet stays missing, which floods
+ * both directions of the control channel exactly when the network is
+ * already struggling (see docs/bugs/2026-09-14-audio-resume-latency-on-seek.md,
+ * confirmed empirically: ~760 duplicate requests per ~2.8s real audio
+ * dropout, and separately via tools/test-audio-resend-storm-e2e.sh's
+ * 1:1 packet-to-request ratio before this fix). Does not change the
+ * *first* request for a given gap -- only suppresses repeat firing for
+ * the *same* gap within this interval.*/
+#define RAOP_RESEND_MIN_INTERVAL_NS 100000000ULL /* 100ms */
 
 typedef struct {
     /* Data available */
@@ -59,6 +74,15 @@ struct raop_buffer_s {
     int is_empty;
     unsigned short first_seqnum;
     unsigned short last_seqnum;
+
+    /* Resend-request rate limiting (see RAOP_RESEND_MIN_INTERVAL_NS
+     * above). last_resend_requested is a plain bool, not inferred from
+     * last_resend_request_ns == 0: CLOCK_MONOTONIC's epoch is
+     * unspecified, so an actual reading of exactly 0 is possible on some
+     * platforms and would otherwise misfire as "never requested". */
+    bool last_resend_requested;
+    unsigned short last_resend_first_seqnum;
+    uint64_t last_resend_request_ns;
 
     /* RTP buffer entries */
     raop_buffer_entry_t entries[RAOP_BUFFER_LENGTH];
@@ -283,6 +307,24 @@ void raop_buffer_handle_resends(raop_buffer_t *raop_buffer, raop_resend_cb_t res
 	    count++;
         }
         if (count){
+            /* Rate limit: a genuinely new gap (first_seqnum changed since
+             * the last request, e.g. this one just arrived, or the
+             * previous gap resolved and a new one opened) always fires
+             * immediately, same as before this check existed. A gap that
+             * is STILL the same first_seqnum as last time only re-fires
+             * once RAOP_RESEND_MIN_INTERVAL_NS has passed -- see that
+             * macro's comment for why this exists at all. */
+            struct timespec now_ts;
+            clock_gettime(CLOCK_MONOTONIC, &now_ts);
+            uint64_t now_ns = (uint64_t) now_ts.tv_sec * 1000000000ULL + (uint64_t) now_ts.tv_nsec;
+            bool same_gap = raop_buffer->last_resend_requested &&
+                             raop_buffer->last_resend_first_seqnum == raop_buffer->first_seqnum;
+            if (same_gap && (now_ns - raop_buffer->last_resend_request_ns) < RAOP_RESEND_MIN_INTERVAL_NS) {
+                return;
+            }
+            raop_buffer->last_resend_requested = true;
+            raop_buffer->last_resend_first_seqnum = raop_buffer->first_seqnum;
+            raop_buffer->last_resend_request_ns = now_ns;
             resend_cb(opaque, raop_buffer->first_seqnum, count);
         }
     }

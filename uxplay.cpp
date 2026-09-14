@@ -381,6 +381,7 @@ static unsigned short airplay_port;
  * side. */
 static bool do_threadtest = false;
 static bool do_ntp_resync_check = false;
+static bool do_resend_storm_check = false;
 static int threadtest_cycles = 8;
 
 static double tt_now(void) {
@@ -686,6 +687,200 @@ static gpointer threadtest_ntp_resync_check(gpointer data) {
 
     fairplay_destroy(myfp);
     close(sock);
+    fflush(stderr); exit(0);
+    return NULL;
+}
+
+/* Regression check for the resend-request flood (see
+ * docs/bugs/2026-09-14-audio-resume-latency-on-seek.md): a real capture
+ * showed lib/raop_buffer.c's raop_buffer_handle_resends() firing a brand
+ * new duplicate resend request on every ~5ms select() tick, with no
+ * memory of having just asked, for as long as a packet stays missing --
+ * confirmed via ~760 duplicate requests per ~2.8s real audio dropout.
+ *
+ * Unlike every other driver mode here, this one declares a REAL
+ * (non-zero) controlPort in its SETUP request -- controlPort=0 (what
+ * threadtest_driver()/threadtest_ntp_resync_check() both use) sets
+ * raop_rtp->control_rport=0, i.e. no_resend=true, which skips this whole
+ * code path entirely (see docs/threadtest.md's own note on this). A real
+ * client's resend path is only reachable by actually opting into it.
+ *
+ * Sequence: SETUP with a real controlPort bound to our own socket (so the
+ * server can route resend requests back to us -- it learns our address
+ * from the FIRST packet it receives on its control channel, not by
+ * reading the SETUP body directly, see lib/raop_rtp.c's
+ * got_remote_control_saddr handling; sending the sync packet below from
+ * this exact same bound socket is what teaches it), a real sync packet,
+ * then audio packets 0-4, a deliberate gap (5-7, sent to nobody, ever --
+ * isolates "how hard does the server ask for a permanently missing
+ * packet" with zero recovery-time confound), then 8 onward. Counts
+ * resend-request packets (8 bytes, packet[1]==0xD5 per
+ * raop_rtp_resend_callback()'s own format) arriving on our bound socket
+ * for a fixed window, then reports the count and exits. */
+static gpointer threadtest_resend_storm_check(gpointer data) {
+    (void) data;
+    sleep(1);
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(raop_port);
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    if (connect(sock, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+        fprintf(stderr, "RESEND-STORM-CHECK: FAIL (connect failed: %s)\n", strerror(errno));
+        fflush(stderr); exit(0);
+    }
+    int cseq = 1;
+    std::vector<unsigned char> resp;
+    tt_rtsp_request(sock, "GET", "/info", cseq++, NULL, 0, resp);
+    unsigned char fp1[16] = {0}; fp1[4] = 0x03; fp1[14] = 0x00;
+    tt_rtsp_request(sock, "POST", "/fp-setup", cseq++, fp1, sizeof(fp1), resp);
+    unsigned char fp2[164]; get_random_bytes(fp2, sizeof(fp2)); fp2[4] = 0x03;
+    tt_rtsp_request(sock, "POST", "/fp-setup", cseq++, fp2, sizeof(fp2), resp);
+    fairplay_t *myfp = fairplay_init(NULL);
+    unsigned char scratch142[142], scratch32[32];
+    fairplay_setup(myfp, fp1, scratch142);
+    fairplay_handshake(myfp, fp2, scratch32);
+
+    /* Bind our own control socket first -- its assigned port goes
+     * straight into the SETUP request body below. */
+    int csock = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in my_caddr; memset(&my_caddr, 0, sizeof(my_caddr));
+    my_caddr.sin_family = AF_INET;
+    my_caddr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    if (bind(csock, (struct sockaddr *) &my_caddr, sizeof(my_caddr)) < 0) {
+        fprintf(stderr, "RESEND-STORM-CHECK: FAIL (bind failed: %s)\n", strerror(errno));
+        fflush(stderr); exit(0);
+    }
+    socklen_t my_caddr_len = sizeof(my_caddr);
+    getsockname(csock, (struct sockaddr *) &my_caddr, &my_caddr_len);
+    unsigned short my_cport = ntohs(my_caddr.sin_port);
+
+    unsigned char ekey[72], eiv[16], aeskey[16];
+    get_random_bytes(ekey, sizeof(ekey));
+    get_random_bytes(eiv, sizeof(eiv));
+    fairplay_decrypt(myfp, ekey, aeskey);
+
+    plist_t root = plist_new_dict();
+    plist_dict_set_item(root, "ekey", plist_new_data((const char *) ekey, sizeof(ekey)));
+    plist_dict_set_item(root, "eiv", plist_new_data((const char *) eiv, sizeof(eiv)));
+    plist_dict_set_item(root, "deviceID", plist_new_string("11:22:33:44:55:66"));
+    plist_dict_set_item(root, "timingProtocol", plist_new_string("None"));
+    plist_dict_set_item(root, "timingPort", plist_new_uint(0));
+    plist_t streams = plist_new_array();
+    plist_t stream = plist_new_dict();
+    plist_dict_set_item(stream, "type", plist_new_uint(96));
+    plist_dict_set_item(stream, "ct", plist_new_uint(8));
+    plist_dict_set_item(stream, "spf", plist_new_uint(480));
+    /* The one deliberate difference from every other driver mode here:
+     * a real port, not 0 -- this is what opts into the resend-wait path
+     * being tested at all (lib/raop_rtp.c: no_resend = control_rport==0). */
+    plist_dict_set_item(stream, "controlPort", plist_new_uint(my_cport));
+    plist_dict_set_item(stream, "audioFormat", plist_new_uint(0x1000000));
+    plist_dict_set_item(stream, "isMedia", plist_new_bool(1));
+    plist_dict_set_item(stream, "usingScreen", plist_new_bool(0));
+    plist_array_append_item(streams, stream);
+    plist_dict_set_item(root, "streams", streams);
+    std::vector<unsigned char> body;
+    tt_plist_to_bytes(root, body);
+    plist_free(root);
+
+    std::vector<unsigned char> setup_resp;
+    if (!tt_rtsp_request(sock, "SETUP", "rtsp://127.0.0.1/1", cseq++, body.data(), body.size(), setup_resp)) {
+        fprintf(stderr, "RESEND-STORM-CHECK: FAIL (SETUP request failed)\n");
+        fflush(stderr); exit(0);
+    }
+    plist_t resp_plist = NULL;
+    plist_from_bin((const char *) setup_resp.data(), (uint32_t) setup_resp.size(), &resp_plist);
+    uint64_t dport = 0, server_cport = 0;
+    if (resp_plist) {
+        plist_t rstreams = plist_dict_get_item(resp_plist, "streams");
+        if (rstreams && plist_array_get_size(rstreams) > 0) {
+            plist_t rstream0 = plist_array_get_item(rstreams, 0);
+            plist_t dport_node = plist_dict_get_item(rstream0, "dataPort");
+            plist_t cport_node = plist_dict_get_item(rstream0, "controlPort");
+            if (dport_node) plist_get_uint_val(dport_node, &dport);
+            if (cport_node) plist_get_uint_val(cport_node, &server_cport);
+        }
+        plist_free(resp_plist);
+    }
+    if (!dport || !server_cport) {
+        fprintf(stderr, "RESEND-STORM-CHECK: FAIL (no dataPort/controlPort in SETUP response)\n");
+        fflush(stderr); exit(0);
+    }
+
+    struct sockaddr_in csync_dest; memset(&csync_dest, 0, sizeof(csync_dest));
+    csync_dest.sin_family = AF_INET;
+    csync_dest.sin_port = htons((unsigned short) server_cport);
+    csync_dest.sin_addr.s_addr = inet_addr("127.0.0.1");
+    /* Sent from csock (our bound, declared-controlPort socket), not a
+     * fresh one -- this is how the server learns to route resend
+     * requests back to us at all. */
+    tt_send_sync_packet(csock, &csync_dest, true, 0, (uint64_t) time(NULL));
+    usleep(100000); /* let the server process the sync packet */
+
+    struct sockaddr_in dest; memset(&dest, 0, sizeof(dest));
+    dest.sin_family = AF_INET;
+    dest.sin_port = htons((unsigned short) dport);
+    dest.sin_addr.s_addr = inet_addr("127.0.0.1");
+    int asock = socket(AF_INET, SOCK_DGRAM, 0);
+    aes_ctx_t *enc = aes_cbc_init(aeskey, eiv, AES_ENCRYPT);
+
+    /* seqnums 0-4: normal. 5-7: deliberately never sent, to anyone, ever
+     * -- a permanent gap, isolating "how hard does the server ask" with
+     * zero recovery-time confound. */
+    for (int p = 0; p < 5; p++) {
+        tt_send_audio_packet(asock, &dest, (unsigned short) p, (uint32_t) (p * 480), enc);
+        usleep(5000);
+    }
+    fprintf(stderr, "RESEND-STORM-CHECK: SENT-GAP t=%.6f (seqnum 5-7 never sent)\n", tt_now());
+
+    /* Keep sending packets past the gap (seqnum 8 onward) roughly every
+     * 5ms for the whole window below -- this is what actually drives the
+     * server's select() loop to wake up and re-check
+     * raop_buffer_handle_resends() at all (its timeout branch does a bare
+     * `continue`, skipping that check entirely -- confirmed by an earlier,
+     * simpler version of this test that stopped sending after a short
+     * burst and only caught ~32 requests instead of the flood a
+     * real ~2.8s dropout shows; a real client's own repeated resend
+     * *responses* play this same "keep the loop awake" role, which this
+     * synthetic client deliberately never sends, by design -- see the
+     * function-level comment above). Count resend-request packets
+     * arriving on our bound control socket concurrently -- 8 bytes,
+     * packet[1]==0xD5 per raop_rtp_resend_callback()'s own wire format
+     * (0x80 | (0x55|0x80) == 0xD5), referencing seqnum 5 (the first
+     * missing one). */
+    int resend_request_count = 0;
+    int keepalive_seqnum = 8;
+    double window_start = tt_now();
+    const double window_s = 1.0;
+    double next_send = window_start;
+    struct timeval tv; tv.tv_sec = 0; tv.tv_usec = 2000;
+    setsockopt(csock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    while (tt_now() - window_start < window_s) {
+        double now = tt_now();
+        if (now >= next_send) {
+            tt_send_audio_packet(asock, &dest, (unsigned short) keepalive_seqnum,
+                                  (uint32_t) (keepalive_seqnum * 480), enc);
+            keepalive_seqnum++;
+            next_send += 0.005;
+        }
+        unsigned char buf[64];
+        ssize_t n = recv(csock, buf, sizeof(buf), 0);
+        if (n == 8 && buf[1] == 0xD5) {
+            unsigned short req_seqnum = (unsigned short) ((buf[4] << 8) | buf[5]);
+            if (req_seqnum == 5) {
+                resend_request_count++;
+            }
+        }
+    }
+    fprintf(stderr, "RESEND-STORM-CHECK: RESEND-REQUEST-COUNT %d (in %.1fs, sent %d keepalive packets)\n",
+            resend_request_count, window_s, keepalive_seqnum - 8);
+
+    aes_cbc_destroy(enc);
+    close(asock);
+    fairplay_destroy(myfp);
+    close(sock);
+    close(csock);
     fflush(stderr); exit(0);
     return NULL;
 }
@@ -2469,6 +2664,8 @@ static void parse_arguments (int argc, char *argv[]) {
             }
         } else if (arg == "-ntpresynccheck") {
             do_ntp_resync_check = true;
+        } else if (arg == "-resendstormcheck") {
+            do_resend_storm_check = true;
         } else if (arg == "-nohold") {
             nohold = 1;
         } else if (arg == "-al") {
@@ -4177,11 +4374,11 @@ int main (int argc, char *argv[]) {
         LOGI("Bluetooth LE beacon-based service discovery is possible: PID data written to %s", ble_filename.c_str());
     }
     
-    /* -threadtest/-ntpresynccheck connect directly to 127.0.0.1:<raop_port>
-     * -- no mDNS discovery needed, and no avahi/dns-sd daemon is expected
-     * to be available in the minimal container this is meant to run in
-     * (see docs/threadtest.md). */
-    if (!do_threadtest && !do_ntp_resync_check && register_dnssd()) {
+    /* -threadtest/-ntpresynccheck/-resendstormcheck connect directly to
+     * 127.0.0.1:<raop_port> -- no mDNS discovery needed, and no
+     * avahi/dns-sd daemon is expected to be available in the minimal
+     * container this is meant to run in (see docs/threadtest.md). */
+    if (!do_threadtest && !do_ntp_resync_check && !do_resend_storm_check && register_dnssd()) {
         stop_raop_server();
         stop_dnssd();
         cleanup();
@@ -4195,6 +4392,10 @@ int main (int argc, char *argv[]) {
     if (do_ntp_resync_check) {
         setenv("UX_THREADTEST_DIAG", "1", 1);
         g_thread_new("ntp-resync-check", threadtest_ntp_resync_check, NULL);
+    }
+    if (do_resend_storm_check) {
+        setenv("UX_THREADTEST_DIAG", "1", 1);
+        g_thread_new("resend-storm-check", threadtest_resend_storm_check, NULL);
     }
     reconnect:
     compression_type = 0;
