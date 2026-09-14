@@ -21,10 +21,74 @@
  */
 
 #include <math.h>
+#include <time.h>
+#include <stdio.h>
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
 #include "audio_renderer.h"
 #define SECOND_IN_NSECS 1000000000UL
+
+/* -threadtest diagnostic timing (see uxplay.cpp's threadtest_driver and
+ * docs/threadtest.md) -- gated by env var since this file doesn't see
+ * uxplay.cpp's do_threadtest global; zero cost/output unless
+ * UX_THREADTEST_DIAG is set (-threadtest sets it automatically). */
+static double tt_diag_now(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double) ts.tv_sec + (double) ts.tv_nsec / 1e9;
+}
+#define TT_DIAG(...) do { if (g_getenv("UX_THREADTEST_DIAG")) { fprintf(stderr, __VA_ARGS__); } } while (0)
+
+/* -threadtest diagnostic only: how many audio_renderer_render_buffer() /
+ * decoded-buffer callbacks since the last (re)start -- reset to 0 by every
+ * branch of audio_renderer_start() that actually did something. Declared
+ * here (not next to audio_renderer_start() below) so the decode-probe
+ * callback above it in this file can also see it. */
+static int tt_calls_since_start = 0;
+
+/* Lightweight decode-output counter (log-only, no buffer-content
+ * inspection at all -- deliberately NOT av_sync_probe/UX_PROBE, whose
+ * per-buffer content mapping requires real concurrent video+audio
+ * threading to have ever been exercised safely; see docs/threadtest.md).
+ * Attached once, at pipeline-construction time, to the decoder element's
+ * SRC pad
+ * (avdec_aac/avdec_alac -- found by factory name, not element name, since
+ * GStreamer's auto-numbering isn't guaranteed) -- answers "did decoded PCM
+ * ever leave the decoder after a restart" without touching sample data,
+ * so it carries none of av_sync_probe's per-buffer gst_buffer_map risk. */
+static GstPadProbeReturn tt_decode_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) {
+    (void) pad; (void) info; (void) user_data;
+    if (tt_calls_since_start < 6) {
+        TT_DIAG("threadtest: DECODED-BUFFER-OUT t=%.6f\n", tt_diag_now());
+    }
+    return GST_PAD_PROBE_OK;
+}
+static void install_decode_probe(GstElement *pipeline) {
+    GstIterator *it = gst_bin_iterate_elements(GST_BIN(pipeline));
+    GValue v = G_VALUE_INIT;
+    gboolean done = FALSE;
+    while (!done) {
+        switch (gst_iterator_next(it, &v)) {
+        case GST_ITERATOR_OK: {
+            GstElement *el = GST_ELEMENT(g_value_get_object(&v));
+            GstElementFactory *f = gst_element_get_factory(el);
+            const gchar *fname = f ? GST_OBJECT_NAME(f) : "";
+            if (fname && g_str_has_prefix(fname, "avdec_")) {
+                GstPad *p = gst_element_get_static_pad(el, "src");
+                if (p) {
+                    gst_pad_add_probe(p, GST_PAD_PROBE_TYPE_BUFFER, tt_decode_probe, NULL, NULL);
+                    gst_object_unref(p);
+                }
+            }
+            g_value_reset(&v);
+            break;
+        }
+        case GST_ITERATOR_RESYNC: gst_iterator_resync(it); break;
+        default: done = TRUE; break;
+        }
+    }
+    g_value_unset(&v);
+    gst_iterator_free(it);
+}
 
 /* A/V sync self-measurement probe installer, defined in video_renderer.c */
 void install_av_sync_probe(GstElement *pipeline);
@@ -210,6 +274,7 @@ void audio_renderer_init(logger_t *render_logger, const char* audiosink, const b
         g_assert (renderer_type[i]->pipeline);
         gst_pipeline_use_clock(GST_PIPELINE_CAST(renderer_type[i]->pipeline), clock);
         install_av_sync_probe(renderer_type[i]->pipeline);
+        install_decode_probe(renderer_type[i]->pipeline);
         renderer_type[i]->bus = gst_element_get_bus(renderer_type[i]->pipeline);
         renderer_type[i]->appsrc = gst_bin_get_by_name (GST_BIN (renderer_type[i]->pipeline), "audio_source");
         renderer_type[i]->volume = gst_bin_get_by_name (GST_BIN (renderer_type[i]->pipeline), "volume");
@@ -294,44 +359,55 @@ void  audio_renderer_start(unsigned char *ct) {
     int id = -1;
     get_renderer_type(ct, &id);
     if (id >= 0 && renderer) {
-        if(*ct != renderer->ct) {
+        if (*ct != renderer->ct) {
+            /* Genuine codec change: tear down the old pipeline and bring up
+             * the new one -- gst_app_src_end_of_stream() permanently marks
+             * an appsrc EOS'd (cycling the pipeline's state afterward does
+             * NOT clear it; every push after that fails with GST_FLOW_EOS),
+             * so this sequence is only safe when abandoning this renderer
+             * for a different one, never when reusing the same one. */
             gst_app_src_end_of_stream(GST_APP_SRC(renderer->appsrc));
             gst_element_set_state (renderer->pipeline, GST_STATE_NULL);
             logger_log(logger, LOGGER_INFO, "changed audio connection, format %s", format[id]);
             renderer = renderer_type[id];
             gst_element_set_state (renderer->pipeline, GST_STATE_PLAYING);
             gst_audio_pipeline_base_time = gst_element_get_base_time(renderer->appsrc);
+            tt_calls_since_start = 0;
+        } else {
+            /* Same-codec restart (a client tearing down and re-SETUPing
+             * the same AAC-ELD/ALAC stream, e.g. on a track switch): only
+             * the clock reference needs refreshing for the new session. Do
+             * NOT send EOS or cycle pipeline state here (see the comment
+             * above -- that permanently breaks the appsrc). */
+            logger_log(logger, LOGGER_INFO, "restarting audio connection, format %s", format[id]);
+            gst_audio_pipeline_base_time = gst_element_get_base_time(renderer->appsrc);
+            tt_calls_since_start = 0;
+            TT_DIAG("threadtest: main-thread BASE-TIME-REFRESHED t=%.6f\n", tt_diag_now());
         }
     } else if (id >= 0) {
         logger_log(logger, LOGGER_INFO, "start audio connection, format %s", format[id]);
         renderer = renderer_type[id];
         gst_element_set_state (renderer->pipeline, GST_STATE_PLAYING);
         gst_audio_pipeline_base_time = gst_element_get_base_time(renderer->appsrc);
+        tt_calls_since_start = 0;
     } else {
         logger_log(logger, LOGGER_ERR, "unknown audio compression type ct = %d", *ct);
     }
 }
 
-/* 2026-09-13: audio_renderer_start()/_stop() used to be called directly,
- * with no lock, from two different threads -- the httpd thread (via
- * audio_get_format(), a SETUP request's handler) and the RAOP audio
- * thread (via audio_renderer_render_buffer()'s self-heal-on-push-failure
- * path below), both writing the same `renderer` pointer and touching the
- * same GStreamer pipeline state. See docs/audio-pipeline.md's
- * "conn_request() finding" and bugs/2026-09-13-audio-dies-on-repeated-
- * track-switch-setup.md for the full investigation. Fix: defer these two
- * specific call sites onto the main thread's GMainLoop via g_idle_add(),
- * the same pattern already used elsewhere in this project (the overscan
- * GFileMonitor callback) -- serializes them without changing
- * audio_renderer_start()/_stop()'s own synchronous behavior for every
- * OTHER existing caller (audio_renderer_destroy() in particular relies
- * on audio_renderer_stop() completing before it frees the very structures
- * `renderer` points into -- deferring it universally would be a
- * use-after-free once that freed memory is touched later). Packs the
- * single `ct` byte directly into the gpointer via GUINT_TO_POINTER --
- * no heap allocation needed for something this small. */
+/* audio_renderer_start()/_stop() are only invoked from these two deferred
+ * entry points (see docs/audio-pipeline.md): g_idle_add() onto the main
+ * thread's GMainLoop serializes the httpd thread's SETUP-triggered start
+ * and the RAOP audio thread's self-heal restart without a lock, so both
+ * only ever run on the main thread. Every other existing caller of the
+ * synchronous audio_renderer_start()/_stop() is unaffected
+ * (audio_renderer_destroy() in particular relies on audio_renderer_stop()
+ * completing synchronously before it frees the structures `renderer`
+ * points into). Packs the single `ct` byte directly into the gpointer via
+ * GUINT_TO_POINTER -- no heap allocation needed for something this small. */
 static gboolean audio_renderer_deferred_start_cb(gpointer data) {
     unsigned char ct = (unsigned char) GPOINTER_TO_UINT(data);
+    TT_DIAG("threadtest: main-thread DEFERRED-START-RUNNING t=%.6f\n", tt_diag_now());
     audio_renderer_start(&ct);
     return G_SOURCE_REMOVE;
 }
@@ -361,6 +437,14 @@ void audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned s
     GstBuffer *buffer = NULL;
 
     if (!render_audio) return;    /* do nothing unless render_audio == TRUE */
+
+    if (tt_calls_since_start < 3) {
+        TT_DIAG("threadtest: RAOP-audio-thread RENDER-BUFFER-CALL t=%.6f seqnum=%u ntp_time=%llu"
+                " base_time=%llu (pts_would_be_negative=%d)\n", tt_diag_now(), (unsigned) *seqnum,
+                (unsigned long long) *ntp_time, (unsigned long long) gst_audio_pipeline_base_time,
+                (int) (*ntp_time < (uint64_t) gst_audio_pipeline_base_time));
+        tt_calls_since_start++;
+    }
 
     GstClockTime pts = (GstClockTime) *ntp_time ;    /* now in nsecs */
     //GstClockTimeDiff latency = GST_CLOCK_DIFF(gst_element_get_current_clock_time (renderer->appsrc), pts);

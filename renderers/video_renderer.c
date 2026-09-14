@@ -289,14 +289,23 @@ static GstPadProbeReturn av_sync_probe(GstPad *pad, GstPadProbeInfo *info, gpoin
     if (!gst_buffer_map(buf, &map, GST_MAP_READ)) return GST_PAD_PROBE_OK;
     gboolean marker = FALSE;
     if (is_audio) {
-        /* S16LE samples: peak amplitude. Loud accent >> quiet baseline. */
+        /* S16LE samples: peak amplitude. Loud accent >> quiet baseline.
+         * Same pass also accumulates |sample| for a genuine average-abs-
+         * amplitude reading (avg_abs) -- this is the actual "is real decoded
+         * audio flowing" signal: unlike loud_pct (tuned for the sync test
+         * clip's specific accent bursts) it reads as a small positive number
+         * for ordinary program audio and drops to ~0 the moment the renderer
+         * stops receiving/decoding real samples (silence, a stuck pipeline,
+         * or a renderer fed all-zero buffers). */
         gint16 *s = (gint16 *) map.data;
         gsize n = map.size / 2;
         int loud = 0, cnt = 0;
-        for (gsize i = 0; i < n; i += 3) { int a = s[i]; if (a < 0) a = -a; if (a > 26000) loud++; cnt++; }
+        long sum_abs = 0;
+        for (gsize i = 0; i < n; i += 3) { int a = s[i]; if (a < 0) a = -a; if (a > 26000) loud++; sum_abs += a; cnt++; }
         int pct = cnt > 0 ? (loud * 100 / cnt) : 0;   /* accent burst saturates far more samples than baseline */
+        double avg_abs = cnt > 0 ? (double) sum_abs / cnt : 0.0;
         marker = (pct > 55);
-        if (g_getenv("UX_PROBE_DBG")) { static int ac = 0; if ((ac++ % 50) == 0) g_print("APROBE loud_pct=%d\n", pct); }
+        if (g_getenv("UX_PROBE_DBG")) { static int ac = 0; if ((ac++ % 50) == 0) g_print("APROBE loud_pct=%d avg_abs=%.1f\n", pct, avg_abs); }
     } else {
         /* Count bright pixels in the Y plane (first ~2/3 of an I420/NV12 buffer).
          * The flash may cover only the player window (mirrored desktop, not full

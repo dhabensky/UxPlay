@@ -683,6 +683,20 @@ raop_rtp_start_audio(raop_rtp_t *raop_rtp,  unsigned short *control_rport, unsig
     raop_rtp->ct = *ct;
     raop_rtp->rtp_clock_rate = SECOND_IN_NSECS / *sr;
 
+    /* raop_rtp_t persists across every SETUP on this connection, so its
+     * RTP-timestamp<->NTP-time sync state must be reset for each fresh
+     * session: a new SETUP always starts a new RTP timestamp range, and
+     * reusing the previous range's rtp_sync/client_ntp_sync against it in
+     * rtp_time_to_client_ntp() computes a nonsense absolute NTP time until
+     * the next periodic RTCP sync packet (type 0x54) corrects it. Setting
+     * initial_sync back to false makes rtp_time_to_client_ntp() return 0
+     * until a genuine fresh sync arrives, which
+     * audio_renderer_render_buffer()'s "ntp < base_time" re-base path
+     * already handles safely (see docs/audio-pipeline.md). */
+    raop_rtp->rtp_sync = 0;
+    raop_rtp->client_ntp_sync = 0;
+    raop_rtp->initial_sync = false;
+
     /* Initialize ports and sockets */
     raop_rtp->control_lport = *control_lport;
     raop_rtp->data_lport = *data_lport;

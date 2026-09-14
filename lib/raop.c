@@ -299,19 +299,15 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
             /* airplay video has been requested: shut down any running RAOP udp services,
              * UNLESS this new connection is plausibly the same client's own auxiliary
              * connection (e.g. opened when switching tracks within an ongoing mirror
-             * session) rather than a genuinely different client taking over. Upstream's
-             * original behavior here was unconditional -- see
+             * session) rather than a genuinely different client taking over -- see
              * raop_should_teardown_existing_connection()'s own doc comment
-             * (lib/raop_conn_policy.h) and bugs/2026-09-13-audio-dies-on-repeated-
-             * track-switch-setup.md for why that silently killed a just-negotiated
-             * audio session on a real device. */
+             * (lib/raop_conn_policy.h). */
             raop_conn_t *raop_conn = (raop_conn_t *) httpd_get_connection_by_type(raop->httpd, CONNECTION_TYPE_RAOP, 1);
             if (raop_conn && !raop_should_teardown_existing_connection(raop_conn->remote, raop_conn->remotelen,
                                                                         conn->remote, conn->remotelen)) {
                 logger_log(raop->logger, LOGGER_INFO, "New AirPlay connection %p: existing RAOP connection %p"
                            " is from the same remote address -- leaving its audio/mirror/NTP services alone"
-                           " instead of tearing them down (2026-09-13 fix, see"
-                           " bugs/2026-09-13-audio-dies-on-repeated-track-switch-setup.md)", ptr, raop_conn);
+                           " instead of tearing them down", ptr, raop_conn);
                 raop_conn = NULL;
             }
             if (raop_conn) {

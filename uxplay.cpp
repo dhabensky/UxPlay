@@ -66,9 +66,13 @@
 #include "lib/logger.h"
 #include "lib/dnssd.h"
 #include "lib/crypto.h"
+#include "lib/fairplay.h"
 #include "renderers/video_renderer.h"
 #include "renderers/audio_renderer.h"
 #include "renderers/mux_renderer.h"
+#include <plist/plist.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #ifdef DBUS
 #include <dbus/dbus.h>
 #endif
@@ -362,6 +366,498 @@ static int nohold = 0;
 static bool nofreeze = false;
 static unsigned short raop_port;
 static unsigned short airplay_port;
+
+/* --- -threadtest: exercise the REAL multi-threaded architecture (real httpd
+ * thread, real conn_request()/raop_handler_setup(), real per-connection
+ * raop_rtp_thread_udp) via a minimal synthetic AirPlay client driving the
+ * REAL raop server over loopback -- instead of -replay's single-thread
+ * callback-injection model, which cannot exercise any of that. See
+ * docs/threadtest.md for usage and design.
+ *
+ * Deliberately audio-only (no mirror/video traffic): skipping video avoids
+ * needing real H264/DRM hardware -- this can run in a plain Docker
+ * container. Reuses the same fairplay/aes primitives raop_handlers.h
+ * itself uses, so no crypto is reimplemented, just driven from the client
+ * side. */
+static bool do_threadtest = false;
+static bool do_ntp_resync_check = false;
+static int threadtest_cycles = 8;
+
+static double tt_now(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double) ts.tv_sec + (double) ts.tv_nsec / 1e9;
+}
+
+/* Send one RTSP request with an optional binary-plist body over `sock` and
+ * read back the response body (blocks until Content-Length bytes arrive).
+ * Returns false on any socket error. */
+static bool tt_rtsp_request(int sock, const char *method, const char *url, int cseq,
+                             const unsigned char *body, size_t body_len,
+                             std::vector<unsigned char> &resp_body) {
+    std::ostringstream req;
+    req << method << " " << url << " RTSP/1.0\r\n";
+    req << "CSeq: " << cseq << "\r\n";
+    req << "DACP-ID: 0000000000000001\r\n";
+    req << "Active-Remote: 123456789\r\n";
+    req << "User-Agent: UxPlayThreadTest/1.0\r\n";
+    if (body_len) {
+        req << "Content-Type: application/x-apple-binary-plist\r\n";
+        req << "Content-Length: " << body_len << "\r\n";
+    }
+    req << "\r\n";
+    std::string reqstr = req.str();
+    if (send(sock, reqstr.data(), reqstr.size(), 0) < 0) return false;
+    if (body_len && send(sock, body, body_len, 0) < 0) return false;
+
+    std::string headers;
+    char c;
+    while (headers.size() < 4 || headers.compare(headers.size() - 4, 4, "\r\n\r\n") != 0) {
+        ssize_t n = recv(sock, &c, 1, 0);
+        if (n <= 0) return false;
+        headers += c;
+        if (headers.size() > 8192) return false; /* sanity limit */
+    }
+    size_t clpos = headers.find("Content-Length:");
+    long content_length = (clpos != std::string::npos) ? atol(headers.c_str() + clpos + 16) : 0;
+    resp_body.assign((size_t) content_length, 0);
+    size_t got = 0;
+    while ((long) got < content_length) {
+        ssize_t n = recv(sock, resp_body.data() + got, content_length - got, 0);
+        if (n <= 0) return false;
+        got += (size_t) n;
+    }
+    return true;
+}
+
+static void tt_plist_to_bytes(plist_t node, std::vector<unsigned char> &out) {
+    char *data = NULL; uint32_t len = 0;
+    plist_to_bin(node, &data, &len);
+    out.assign(data, data + len);
+    free(data);
+}
+
+/* A real, genuine AAC-ELD frame (decrypted payload captured from a real
+ * session via -capture, tools/captures/audio-dies-final-20260913.cap, frame
+ * #5) -- used as this test's RTP payload instead of fake bytes, so the real
+ * avdec_aac decoder in the real pipeline has genuine content to decode
+ * (whether it decodes cleanly is itself part of what this test can now
+ * observe, not just whether gst_app_src_push_buffer() returns GST_FLOW_OK). */
+static const unsigned char tt_real_aac_eld_frame[267] = {
+    0x8d, 0xff, 0xff, 0xff, 0xe0, 0xf4, 0x96, 0x6a, 0x54, 0x31, 0x88, 0x82, 0x00, 0xbe, 0xe0, 0xd0,
+    0x49, 0xb4, 0x13, 0xaa, 0x71, 0x4b, 0x5a, 0xee, 0xdf, 0x6c, 0xed, 0xae, 0x53, 0xb5, 0xd8, 0x44,
+    0x64, 0xfe, 0x25, 0x06, 0x7c, 0x04, 0x1e, 0x25, 0xfe, 0xf3, 0x29, 0x3d, 0xf7, 0x73, 0x36, 0xd2,
+    0x46, 0x73, 0xd9, 0x3a, 0x2d, 0x26, 0xbf, 0xd2, 0xca, 0x92, 0xce, 0x71, 0x59, 0x4e, 0x1f, 0xa7,
+    0x59, 0xed, 0x49, 0x1d, 0x50, 0x3e, 0xd1, 0x30, 0x99, 0x25, 0x21, 0xa1, 0xde, 0xf9, 0x3c, 0x7d,
+    0x22, 0x3b, 0xf4, 0x1b, 0xfa, 0x91, 0x8c, 0xde, 0xdd, 0x65, 0x44, 0x81, 0x3b, 0x0b, 0x1c, 0xa4,
+    0xf4, 0x9a, 0x6b, 0x5c, 0x1a, 0xda, 0xed, 0xeb, 0xc9, 0x14, 0xf2, 0xcf, 0x36, 0x9c, 0xf1, 0xe2,
+    0x10, 0xa1, 0xce, 0xda, 0x60, 0x74, 0x18, 0xe5, 0xbe, 0x4b, 0x44, 0x2d, 0x24, 0xd2, 0x11, 0xea,
+    0xce, 0x03, 0xe9, 0x19, 0x90, 0x73, 0x27, 0x56, 0xd1, 0x0b, 0xc7, 0x25, 0xf9, 0x73, 0x79, 0x55,
+    0x5f, 0x32, 0x9f, 0x3e, 0x14, 0x3f, 0x2b, 0x14, 0x06, 0x85, 0xcf, 0x61, 0x4f, 0x91, 0x5d, 0x3a,
+    0x21, 0x93, 0xeb, 0xe1, 0x65, 0x50, 0xb5, 0xd3, 0x2e, 0x3d, 0x92, 0xe9, 0x6c, 0xb7, 0xcf, 0xce,
+    0x43, 0x1e, 0xfa, 0x1f, 0xa8, 0xa8, 0x88, 0x33, 0x1f, 0x80, 0x28, 0x13, 0x38, 0xc3, 0x09, 0x40,
+    0x8a, 0x34, 0xdf, 0x67, 0xfa, 0xbe, 0x9f, 0x88, 0x85, 0x05, 0xa2, 0x10, 0x24, 0x03, 0xf9, 0x44,
+    0x40, 0x17, 0x9b, 0x3c, 0x7e, 0xaf, 0xe3, 0xf7, 0x4a, 0xaf, 0x01, 0x0a, 0x8f, 0xf9, 0xc3, 0x13,
+    0xf5, 0xae, 0x3a, 0xfc, 0x61, 0x93, 0xf6, 0x40, 0xed, 0x81, 0x0e, 0xf6, 0x1f, 0xbb, 0xd7, 0x8e,
+    0x35, 0x9f, 0x5f, 0xc7, 0xda, 0x21, 0x0d, 0x8b, 0xd5, 0x34, 0x9e, 0x21, 0xb5, 0x00, 0x22, 0x72,
+    0x80, 0xaf, 0xf6, 0x7e, 0xf3, 0xb7, 0xe3, 0x9a, 0xe4, 0xc0, 0x00
+};
+
+/* One AES-128-CBC-encrypted RTP audio packet, matching raop_buffer_decrypt()'s
+ * expected wire format exactly (lib/raop_buffer.c:117-137): 12-byte RTP
+ * header (version/pt byte0-1, seqnum be16, rtp_ts be32, ssrc be32), then the
+ * real AAC-ELD payload above with every full 16-byte block AES-CBC encrypted
+ * (IV reset to the session's aesiv before each packet -- no chaining across
+ * packets) and the trailing partial block left in cleartext, exactly as
+ * raop_buffer_decrypt() expects to reverse it. */
+static ssize_t tt_send_audio_packet(int sock, struct sockaddr_in *dest, unsigned short seqnum,
+                                  uint32_t rtp_ts, aes_ctx_t *enc_ctx) {
+    const unsigned char *plain = tt_real_aac_eld_frame;
+    const size_t plain_len = sizeof(tt_real_aac_eld_frame);
+    const size_t encrypted_len = (plain_len / 16) * 16;
+    unsigned char packet[12 + sizeof(tt_real_aac_eld_frame)];
+    packet[0] = 0x80; packet[1] = 0x60;
+    packet[2] = (unsigned char) (seqnum >> 8); packet[3] = (unsigned char) seqnum;
+    packet[4] = (unsigned char) (rtp_ts >> 24); packet[5] = (unsigned char) (rtp_ts >> 16);
+    packet[6] = (unsigned char) (rtp_ts >> 8);  packet[7] = (unsigned char) rtp_ts;
+    packet[8] = packet[9] = packet[10] = packet[11] = 0;
+    aes_cbc_encrypt(enc_ctx, plain, packet + 12, (int) encrypted_len);
+    aes_cbc_reset(enc_ctx);
+    memcpy(packet + 12 + encrypted_len, plain + encrypted_len, plain_len - encrypted_len);
+    return sendto(sock, packet, (size_t) (12 + plain_len), 0, (struct sockaddr *) dest, sizeof(*dest));
+}
+
+/* RTCP sync packet (type 0x54), sent by a real client to the server's own
+ * control socket (the "controlPort" from the SETUP response -- unrelated
+ * to the client-side remote_cport this driver leaves at 0) to establish
+ * the RTP-timestamp<->NTP-time mapping. Wire format per raop_rtp.c's own
+ * parsing comment: packet[0]=0x90 (first) or 0x80 (subsequent),
+ * packet[1]=0xd4, packet[2:3]=0x00 0x04, packet[4:7]=sync_rtp (be32),
+ * packet[8:15]=remote ntp timestamp (be64, seconds<<32|fraction -- no
+ * 1900/1970 epoch adjustment applied server-side when timingProtocol is
+ * "None", as this driver always sends), packet[16:20]=next_rtp (be32). */
+static void tt_send_sync_packet(int sock, struct sockaddr_in *dest, bool first,
+                                 uint32_t sync_rtp, uint64_t ntp_seconds_since_epoch) {
+    unsigned char packet[20] = {0};
+    packet[0] = first ? 0x90 : 0x80;
+    packet[1] = 0xd4;
+    packet[2] = 0x00; packet[3] = 0x04;
+    packet[4] = (unsigned char) (sync_rtp >> 24); packet[5] = (unsigned char) (sync_rtp >> 16);
+    packet[6] = (unsigned char) (sync_rtp >> 8);  packet[7] = (unsigned char) sync_rtp;
+    uint64_t ntp_raw = ntp_seconds_since_epoch << 32; /* zero fraction */
+    for (int i = 0; i < 8; i++) packet[8 + i] = (unsigned char) (ntp_raw >> (56 - 8 * i));
+    uint32_t next_rtp = sync_rtp + 7497;
+    packet[16] = (unsigned char) (next_rtp >> 24); packet[17] = (unsigned char) (next_rtp >> 16);
+    packet[18] = (unsigned char) (next_rtp >> 8);  packet[19] = (unsigned char) next_rtp;
+    sendto(sock, packet, sizeof(packet), 0, (struct sockaddr *) dest, sizeof(*dest));
+}
+
+/* Differential regression check for the NTP-sync-state-not-reset-on-restart
+ * bug (see docs/audio-pipeline.md). Sequence:
+ *   1. First SETUP, then a real sync packet (establishes initial_sync=true
+ *      with a known rtp_sync/client_ntp_sync mapping).
+ *   2. TEARDOWN + second SETUP (restart, same connection).
+ *   3. Immediately send one audio packet with a small, fresh-session-like
+ *      RTP timestamp -- *before* any new sync packet.
+ *   4. Wait, then send a *second* sync packet (what a real client
+ *      eventually does again).
+ *   5. Send a second audio packet after that.
+ *
+ * lib/raop_rtp.c's own dequeue loop only dispatches to audio_process() at
+ * all once initial_sync is true (`if (!raop_rtp->initial_sync) continue;`)
+ * -- a pre-existing, deliberate cold-start guard. On correctly-fixed code,
+ * initial_sync is reset to false on restart, so step 3's packet must be
+ * *withheld* (no RENDER-BUFFER-CALL at all) until step 4's fresh sync
+ * arrives, after which step 5's packet (and step 3's, once dequeued) must
+ * render. On unfixed code, initial_sync never resets, so step 3's packet
+ * renders *immediately*, using the stale mapping from step 1's sync
+ * against step 3's unrelated fresh RTP timestamp range.
+ *
+ * This prints plain timestamped markers (SENT-PROBE-A/SENT-SYNC-2/
+ * SENT-PROBE-B) and relies on the existing RENDER-BUFFER-CALL diagnostic
+ * (renderers/audio_renderer.c) for timing -- the actual PASS/FAIL verdict
+ * is computed by tools/test-audio-ntp-resync-e2e.sh from the combined
+ * log's timestamps, which also runs this against both an old and a new
+ * build and asserts fail-old/pass-new. */
+static gpointer threadtest_ntp_resync_check(gpointer data) {
+    (void) data;
+    sleep(1);
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(raop_port);
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    if (connect(sock, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+        fprintf(stderr, "NTP-RESYNC-CHECK: FAIL (connect failed: %s)\n", strerror(errno));
+        fflush(stderr); exit(0);
+    }
+    int cseq = 1;
+    std::vector<unsigned char> resp;
+    tt_rtsp_request(sock, "GET", "/info", cseq++, NULL, 0, resp);
+    unsigned char fp1[16] = {0}; fp1[4] = 0x03; fp1[14] = 0x00;
+    tt_rtsp_request(sock, "POST", "/fp-setup", cseq++, fp1, sizeof(fp1), resp);
+    unsigned char fp2[164]; get_random_bytes(fp2, sizeof(fp2)); fp2[4] = 0x03;
+    tt_rtsp_request(sock, "POST", "/fp-setup", cseq++, fp2, sizeof(fp2), resp);
+    fairplay_t *myfp = fairplay_init(NULL);
+    unsigned char scratch142[142], scratch32[32];
+    fairplay_setup(myfp, fp1, scratch142);
+    fairplay_handshake(myfp, fp2, scratch32);
+
+    auto do_setup = [&](bool first_setup) -> uint64_t {
+        unsigned char ekey[72], eiv[16];
+        get_random_bytes(ekey, sizeof(ekey));
+        get_random_bytes(eiv, sizeof(eiv));
+        plist_t root = plist_new_dict();
+        if (first_setup) {
+            plist_dict_set_item(root, "ekey", plist_new_data((const char *) ekey, sizeof(ekey)));
+            plist_dict_set_item(root, "eiv", plist_new_data((const char *) eiv, sizeof(eiv)));
+            plist_dict_set_item(root, "deviceID", plist_new_string("11:22:33:44:55:66"));
+            plist_dict_set_item(root, "timingProtocol", plist_new_string("None"));
+            plist_dict_set_item(root, "timingPort", plist_new_uint(0));
+        }
+        plist_t streams = plist_new_array();
+        plist_t stream = plist_new_dict();
+        plist_dict_set_item(stream, "type", plist_new_uint(96));
+        plist_dict_set_item(stream, "ct", plist_new_uint(8));
+        plist_dict_set_item(stream, "spf", plist_new_uint(480));
+        plist_dict_set_item(stream, "controlPort", plist_new_uint(0));
+        plist_dict_set_item(stream, "audioFormat", plist_new_uint(0x1000000));
+        plist_dict_set_item(stream, "isMedia", plist_new_bool(1));
+        plist_dict_set_item(stream, "usingScreen", plist_new_bool(0));
+        plist_array_append_item(streams, stream);
+        plist_dict_set_item(root, "streams", streams);
+        std::vector<unsigned char> body;
+        tt_plist_to_bytes(root, body);
+        plist_free(root);
+        std::vector<unsigned char> setup_resp;
+        tt_rtsp_request(sock, "SETUP", "rtsp://127.0.0.1/1", cseq++, body.data(), body.size(), setup_resp);
+        plist_t resp_plist = NULL;
+        plist_from_bin((const char *) setup_resp.data(), (uint32_t) setup_resp.size(), &resp_plist);
+        uint64_t dport = 0, cport = 0;
+        if (resp_plist) {
+            plist_t rstreams = plist_dict_get_item(resp_plist, "streams");
+            if (rstreams && plist_array_get_size(rstreams) > 0) {
+                plist_t rstream0 = plist_array_get_item(rstreams, 0);
+                plist_t dport_node = plist_dict_get_item(rstream0, "dataPort");
+                plist_t cport_node = plist_dict_get_item(rstream0, "controlPort");
+                if (dport_node) plist_get_uint_val(dport_node, &dport);
+                if (cport_node) plist_get_uint_val(cport_node, &cport);
+            }
+            plist_free(resp_plist);
+        }
+        return (dport << 32) | cport;
+    };
+
+    /* --- First SETUP: establish a real session and a real sync. --- */
+    uint64_t ports1 = do_setup(true);
+    unsigned short dport1 = (unsigned short) (ports1 >> 32);
+    unsigned short cport1 = (unsigned short) ports1;
+    if (!dport1 || !cport1) {
+        fprintf(stderr, "NTP-RESYNC-CHECK: FAIL (first SETUP gave no dataPort/controlPort)\n");
+        fflush(stderr); exit(0);
+    }
+    struct sockaddr_in csync_dest; memset(&csync_dest, 0, sizeof(csync_dest));
+    csync_dest.sin_family = AF_INET; csync_dest.sin_port = htons(cport1);
+    csync_dest.sin_addr.s_addr = inet_addr("127.0.0.1");
+    int csock = socket(AF_INET, SOCK_DGRAM, 0);
+    uint64_t now_s = (uint64_t) time(NULL);
+    tt_send_sync_packet(csock, &csync_dest, true, 0, now_s);
+    usleep(100000); /* let the server process the sync packet */
+    close(csock);
+
+    /* --- Restart on the same connection: TEARDOWN + second SETUP. --- */
+    plist_t td = plist_new_dict();
+    plist_t td_streams = plist_new_array();
+    plist_t td_stream = plist_new_dict();
+    plist_dict_set_item(td_stream, "type", plist_new_uint(96));
+    plist_array_append_item(td_streams, td_stream);
+    plist_dict_set_item(td, "streams", td_streams);
+    std::vector<unsigned char> td_body;
+    tt_plist_to_bytes(td, td_body);
+    plist_free(td);
+    std::vector<unsigned char> td_resp;
+    tt_rtsp_request(sock, "TEARDOWN", "rtsp://127.0.0.1/1", cseq++, td_body.data(), td_body.size(), td_resp);
+
+    uint64_t ports2 = do_setup(false);
+    unsigned short dport2 = (unsigned short) (ports2 >> 32);
+    unsigned short cport2 = (unsigned short) ports2;
+    if (!dport2 || !cport2) {
+        fprintf(stderr, "NTP-RESYNC-CHECK: FAIL (second SETUP gave no dataPort/controlPort)\n");
+        fflush(stderr); exit(0);
+    }
+
+    unsigned char probe_key[16] = {0}, probe_iv[16] = {0};
+    struct sockaddr_in dest2; memset(&dest2, 0, sizeof(dest2));
+    dest2.sin_family = AF_INET; dest2.sin_port = htons(dport2);
+    dest2.sin_addr.s_addr = inet_addr("127.0.0.1");
+    struct sockaddr_in csync_dest2; memset(&csync_dest2, 0, sizeof(csync_dest2));
+    csync_dest2.sin_family = AF_INET; csync_dest2.sin_port = htons(cport2);
+    csync_dest2.sin_addr.s_addr = inet_addr("127.0.0.1");
+    setenv("UX_THREADTEST_DIAG", "1", 1);
+
+    /* Step 3: probe packet A, small fresh RTP timestamp, sent BEFORE any
+     * new sync -- exactly the window the bug lives in. On unfixed code
+     * this renders immediately (stale sync reused); on fixed code it must
+     * be withheld until step 4. */
+    int asock = socket(AF_INET, SOCK_DGRAM, 0);
+    aes_ctx_t *enc = aes_cbc_init(probe_key, probe_iv, AES_ENCRYPT);
+    fprintf(stderr, "NTP-RESYNC-CHECK: SENT-PROBE-A t=%.6f\n", tt_now());
+    tt_send_audio_packet(asock, &dest2, 1, 100, enc);
+    usleep(400000); /* give an unfixed binary's immediate render a chance to show up */
+
+    /* Step 4: a second, fresh sync packet -- what a real client eventually
+     * sends again. On fixed code, this is what un-withholds step 3 (and
+     * everything after). */
+    int csock2 = socket(AF_INET, SOCK_DGRAM, 0);
+    fprintf(stderr, "NTP-RESYNC-CHECK: SENT-SYNC-2 t=%.6f\n", tt_now());
+    tt_send_sync_packet(csock2, &csync_dest2, false, 0, (uint64_t) time(NULL));
+    usleep(200000);
+    close(csock2);
+
+    /* Step 5: probe packet B, after the fresh sync -- must render on both
+     * fixed and unfixed code (this is the "does it ever recover at all"
+     * control, so a binary that just holds everything forever doesn't
+     * accidentally read as "fixed"). */
+    fprintf(stderr, "NTP-RESYNC-CHECK: SENT-PROBE-B t=%.6f\n", tt_now());
+    tt_send_audio_packet(asock, &dest2, 2, 200, enc);
+    usleep(400000);
+    close(asock);
+    aes_cbc_destroy(enc);
+    fprintf(stderr, "NTP-RESYNC-CHECK: done, verdict is in the RENDER-BUFFER-CALL timestamps above\n");
+
+    fairplay_destroy(myfp);
+    close(sock);
+    fflush(stderr); exit(0);
+    return NULL;
+}
+
+static gpointer threadtest_driver(gpointer data) {
+    (void) data;
+    sleep(1); /* let raop_start_httpd's thread + register_dnssd settle */
+    fprintf(stderr, "threadtest: connecting to 127.0.0.1:%u\n", raop_port);
+
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(raop_port);
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    if (connect(sock, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+        fprintf(stderr, "threadtest: connect failed: %s\n", strerror(errno));
+        return NULL;
+    }
+
+    int cseq = 1;
+    std::vector<unsigned char> resp;
+    /* Any request carrying CSeq classifies this connection as RAOP-type
+     * (raop.c's conn_request(), `if (cseq || ble)` branch). */
+    tt_rtsp_request(sock, "GET", "/info", cseq++, NULL, 0, resp);
+
+    /* fp-setup message 1: 16 bytes, req[4]=version(3), req[14]=mode(0-3). */
+    unsigned char fp1[16] = {0}; fp1[4] = 0x03; fp1[14] = 0x00;
+    tt_rtsp_request(sock, "POST", "/fp-setup", cseq++, fp1, sizeof(fp1), resp);
+
+    /* fp-setup message 2: 164 bytes, req[4]=version(3), rest arbitrary --
+     * the server just stores it as fp->keymsg (fairplay_handshake(),
+     * lib/fairplay_playfair.c:64-80); it becomes the key material for every
+     * later fairplay_decrypt() call on this connection. */
+    unsigned char fp2[164]; get_random_bytes(fp2, sizeof(fp2)); fp2[4] = 0x03;
+    tt_rtsp_request(sock, "POST", "/fp-setup", cseq++, fp2, sizeof(fp2), resp);
+
+    /* Compute, offline, exactly what aeskey the server will derive for a
+     * chosen 72-byte ekey blob -- by running the identical fairplay_decrypt()
+     * ourselves against the same fp1/fp2 messages we just sent it. No RSA,
+     * no per-server public key involved: FairPlay's legacy transform only
+     * depends on what THIS client sends, so this is exact, not a guess. */
+    fairplay_t *myfp = fairplay_init(NULL);
+    unsigned char scratch142[142], scratch32[32];
+    fairplay_setup(myfp, fp1, scratch142);
+    fairplay_handshake(myfp, fp2, scratch32);
+
+    for (int cycle = 0; cycle < threadtest_cycles; cycle++) {
+        unsigned char ekey[72], eiv[16], aeskey[16];
+        get_random_bytes(ekey, sizeof(ekey));
+        get_random_bytes(eiv, sizeof(eiv));
+        fairplay_decrypt(myfp, ekey, aeskey);
+
+        plist_t root = plist_new_dict();
+        if (cycle == 0) {
+            /* Only the very FIRST SETUP on a connection carries ekey/eiv
+             * (raop_handlers.h:630's "first SETUP" branch) -- matching every
+             * real capture this session: "SETUP 1" logged exactly once per
+             * connection, never on the later same-connection restarts. */
+            plist_dict_set_item(root, "ekey", plist_new_data((const char *) ekey, sizeof(ekey)));
+            plist_dict_set_item(root, "eiv", plist_new_data((const char *) eiv, sizeof(eiv)));
+            plist_dict_set_item(root, "deviceID", plist_new_string("11:22:33:44:55:66"));
+            plist_dict_set_item(root, "timingProtocol", plist_new_string("None"));
+            plist_dict_set_item(root, "timingPort", plist_new_uint(0));
+        }
+        plist_t streams = plist_new_array();
+        plist_t stream = plist_new_dict();
+        plist_dict_set_item(stream, "type", plist_new_uint(96));
+        plist_dict_set_item(stream, "ct", plist_new_uint(8));
+        plist_dict_set_item(stream, "spf", plist_new_uint(480));
+        /* 0, not a real port: a non-zero controlPort sets raop_rtp->
+         * control_rport != 0, which activates raop_buffer_dequeue()'s
+         * resend-wait path (lib/raop_buffer.c:242-251) -- it then withholds
+         * every packet hoping a genuine RTCP resend fills perceived gaps,
+         * which this minimal driver never sends or answers. 0 keeps
+         * raop_rtp.c's no_resend=true, the simple "always return the first
+         * entry" path. */
+        plist_dict_set_item(stream, "controlPort", plist_new_uint(0));
+        plist_dict_set_item(stream, "audioFormat", plist_new_uint(0x1000000));
+        plist_dict_set_item(stream, "isMedia", plist_new_bool(1));
+        plist_dict_set_item(stream, "usingScreen", plist_new_bool(0));
+        plist_array_append_item(streams, stream);
+        plist_dict_set_item(root, "streams", streams);
+
+        std::vector<unsigned char> body;
+        tt_plist_to_bytes(root, body);
+        plist_free(root);
+
+        std::vector<unsigned char> setup_resp;
+        fprintf(stderr, "threadtest: cycle %d SEND-SETUP t=%.6f\n", cycle, tt_now());
+        if (!tt_rtsp_request(sock, "SETUP", "rtsp://127.0.0.1/1", cseq++, body.data(), body.size(), setup_resp)) {
+            fprintf(stderr, "threadtest: cycle %d SETUP request failed, aborting\n", cycle);
+            break;
+        }
+        fprintf(stderr, "threadtest: cycle %d RECV-SETUP-response t=%.6f\n", cycle, tt_now());
+
+        plist_t resp_plist = NULL;
+        plist_from_bin((const char *) setup_resp.data(), (uint32_t) setup_resp.size(), &resp_plist);
+        uint64_t dport = 0;
+        if (resp_plist) {
+            plist_t rstreams = plist_dict_get_item(resp_plist, "streams");
+            if (rstreams && plist_array_get_size(rstreams) > 0) {
+                plist_t rstream0 = plist_array_get_item(rstreams, 0);
+                plist_t dport_node = plist_dict_get_item(rstream0, "dataPort");
+                if (dport_node) plist_get_uint_val(dport_node, &dport);
+            }
+            plist_free(resp_plist);
+        }
+        if (!dport) {
+            fprintf(stderr, "threadtest: cycle %d got no dataPort in SETUP response, aborting\n", cycle);
+            break;
+        }
+
+        int asock = socket(AF_INET, SOCK_DGRAM, 0);
+        struct sockaddr_in dest; memset(&dest, 0, sizeof(dest));
+        dest.sin_family = AF_INET;
+        dest.sin_port = htons((unsigned short) dport);
+        dest.sin_addr.s_addr = inet_addr("127.0.0.1");
+        aes_ctx_t *enc = aes_cbc_init(aeskey, eiv, AES_ENCRYPT);
+        fprintf(stderr, "threadtest: cycle %d FIRST-AUDIO-PACKET t=%.6f (dataPort=%u)\n", cycle, tt_now(), (unsigned) dport);
+        for (int p = 0; p < 20; p++) {
+            tt_send_audio_packet(asock, &dest, (unsigned short) (cycle * 1000 + p),
+                                  (uint32_t) ((cycle * 1000 + p) * 480), enc);
+            usleep(10000);
+        }
+        aes_cbc_destroy(enc);
+        close(asock);
+
+        plist_t td = plist_new_dict();
+        plist_t td_streams = plist_new_array();
+        plist_t td_stream = plist_new_dict();
+        plist_dict_set_item(td_stream, "type", plist_new_uint(96));
+        plist_array_append_item(td_streams, td_stream);
+        plist_dict_set_item(td, "streams", td_streams);
+        std::vector<unsigned char> td_body;
+        tt_plist_to_bytes(td, td_body);
+        plist_free(td);
+        std::vector<unsigned char> td_resp;
+        fprintf(stderr, "threadtest: cycle %d SEND-TEARDOWN t=%.6f\n", cycle, tt_now());
+        tt_rtsp_request(sock, "TEARDOWN", "rtsp://127.0.0.1/1", cseq++, td_body.data(), td_body.size(), td_resp);
+
+        /* Real track switches are seconds to minutes apart, not milliseconds
+         * -- UX_THREADTEST_GAP_S (seconds, default 0) simulates a real
+         * inter-cycle gap, testing whether a long-idle pipeline (queue/
+         * avdec_aac/alsasink left running in PLAYING the whole time, per
+         * this fix's own approach -- see audio_renderer_start()'s "same-ct
+         * restart" branch) resumes cleanly after real starvation, not just
+         * after the sub-second gap rapid cycling leaves. */
+        const char *gap_env = g_getenv("UX_THREADTEST_GAP_S");
+        int gap = gap_env ? atoi(gap_env) : 0;
+        /* Real clients send POST /feedback roughly every 2s; without it the
+         * server's own missed-feedback/-reset mechanism (raop.c, default 15s)
+         * correctly tears the whole connection down as "client may be
+         * offline" -- exactly what happened the first time this test tried
+         * a multi-cycle gap. Not a bug: matches this project's own
+         * documented -reset behavior. Send a keepalive at least every 2s
+         * during any gap longer than that so a long, realistic inter-cycle
+         * gap can actually be tested. */
+        for (int waited = 0; waited < gap; waited += 2) {
+            int chunk = (gap - waited) < 2 ? (gap - waited) : 2;
+            sleep((unsigned) chunk);
+            if (waited + chunk < gap) {
+                std::vector<unsigned char> fb_resp;
+                tt_rtsp_request(sock, "POST", "/feedback", cseq++, NULL, 0, fb_resp);
+            }
+        }
+    }
+
+    fairplay_destroy(myfp);
+    close(sock);
+    fprintf(stderr, "threadtest: done (%d cycles)\n", threadtest_cycles);
+    return NULL;
+}
 static std::vector<std::string> allowed_clients;
 static std::vector<std::string> blocked_clients;
 static bool restrict_clients;
@@ -1932,6 +2428,13 @@ static void parse_arguments (int argc, char *argv[]) {
             if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
             replay_filename = argv[++i];
             do_replay = true;
+        } else if (arg == "-threadtest") {
+            do_threadtest = true;
+            if (i < argc - 1 && *argv[i+1] != '-') {
+                threadtest_cycles = atoi(argv[++i]);
+            }
+        } else if (arg == "-ntpresynccheck") {
+            do_ntp_resync_check = true;
         } else if (arg == "-nohold") {
             nohold = 1;
         } else if (arg == "-al") {
@@ -2855,6 +3358,7 @@ extern "C" void audio_get_format (void *cls, unsigned char *ct, unsigned short *
        * audio_renderer_start() directly -- a real, unsynchronized race
        * against the RAOP audio thread's own self-heal path touching the
        * same renderer/pipeline state. */
+      if (do_threadtest) fprintf(stderr, "threadtest: httpd-thread QUEUE-DEFERRED-START t=%.6f\n", tt_now());
       audio_renderer_start_deferred(*ct);
     }
 
@@ -3641,10 +4145,24 @@ int main (int argc, char *argv[]) {
         LOGI("Bluetooth LE beacon-based service discovery is possible: PID data written to %s", ble_filename.c_str());
     }
     
-    if (register_dnssd()) {
+    /* -threadtest/-ntpresynccheck connect directly to 127.0.0.1:<raop_port>
+     * -- no mDNS discovery needed, and no avahi/dns-sd daemon is expected
+     * to be available in the minimal container this is meant to run in
+     * (see docs/threadtest.md). */
+    if (!do_threadtest && !do_ntp_resync_check && register_dnssd()) {
         stop_raop_server();
         stop_dnssd();
         cleanup();
+    }
+    if (do_threadtest) {
+        LOGI("THREADTEST MODE: driving the real raop server over loopback with %d SETUP/TEARDOWN cycles"
+             " (see docs/threadtest.md)", threadtest_cycles);
+        setenv("UX_THREADTEST_DIAG", "1", 1);
+        g_thread_new("threadtest-driver", threadtest_driver, NULL);
+    }
+    if (do_ntp_resync_check) {
+        setenv("UX_THREADTEST_DIAG", "1", 1);
+        g_thread_new("ntp-resync-check", threadtest_ntp_resync_check, NULL);
     }
     reconnect:
     compression_type = 0;
