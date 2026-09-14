@@ -382,6 +382,7 @@ static unsigned short airplay_port;
 static bool do_threadtest = false;
 static bool do_ntp_resync_check = false;
 static bool do_resend_storm_check = false;
+static bool do_resend_recovery_check = false;
 static int threadtest_cycles = 8;
 
 static double tt_now(void) {
@@ -875,6 +876,198 @@ static gpointer threadtest_resend_storm_check(gpointer data) {
     }
     fprintf(stderr, "RESEND-STORM-CHECK: RESEND-REQUEST-COUNT %d (in %.1fs, sent %d keepalive packets)\n",
             resend_request_count, window_s, keepalive_seqnum - 8);
+
+    aes_cbc_destroy(enc);
+    close(asock);
+    fairplay_destroy(myfp);
+    close(sock);
+    close(csock);
+    fflush(stderr); exit(0);
+    return NULL;
+}
+
+/* End-to-end recovery-time check for the resend-request rate limit fix
+ * (see docs/bugs/2026-09-14-audio-resume-latency-on-seek.md). Unlike
+ * -resendstormcheck above (which never answers -- it isolates "how hard
+ * does the server ask" with zero recovery-time confound), this mode
+ * actually resends the missing packets once requested, but models a
+ * contended channel: a real WiFi link's airtime is shared by every
+ * packet in both directions, and this can't be faithfully reproduced
+ * over a loopback Docker interface (no real contention exists there) --
+ * so this explicitly SIMULATES it instead. Every resend-request packet
+ * received pushes a `channel_busy_until` deadline forward by
+ * CHANNEL_COST_S; the actual resend response is only sent once that
+ * deadline has passed.
+ *
+ * Empirically (2026-09-14), against unfixed code, this model does NOT
+ * converge on its own: with the keepalive stream driving requests every
+ * ~5ms and CHANNEL_COST_S=8ms per request, channel_busy_until races
+ * ahead of real time and the response never gets a clear window. What
+ * actually ends the run is RAOP_BUFFER_LENGTH's own 256-entry cap
+ * (lib/raop_buffer.c) -- once the keepalive seqnum reaches
+ * first_seqnum+256, raop_buffer_enqueue() force-flushes the whole
+ * buffer, silently discarding the still-missing packets rather than
+ * ever resending them cleanly. Confirmed by the numbers lining up almost
+ * exactly (253 keepalive packets at 5ms = 1.265s predicted vs ~1.27s
+ * observed) -- and this matches the real capture too: by the end of each
+ * real ~2.8s dropout, the buffer's backlog had grown to ~259 sequence
+ * numbers, right at this same cap (see the bug doc). So the flood's real
+ * cost isn't just wasted bandwidth -- under sustained loss it can turn a
+ * recoverable gap into a silently-dropped one, by filling the buffer
+ * toward overflow before a legitimate resend ever gets a chance. Fixed
+ * code's sparse 100ms-spaced requests leave the channel clear ~92% of
+ * the time, so the response gets through on essentially the first
+ * request, well before the buffer is anywhere near that cap. This is a
+ * model, not a physical simulation -- it demonstrates the mechanism, not
+ * a literal prediction of "2.8s" (the two aren't causally the same
+ * number, just similar order of magnitude by coincidence of these
+ * parameter choices). */
+static gpointer threadtest_resend_recovery_check(gpointer data) {
+    (void) data;
+    sleep(1);
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(raop_port);
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    if (connect(sock, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+        fprintf(stderr, "RESEND-RECOVERY-CHECK: FAIL (connect failed: %s)\n", strerror(errno));
+        fflush(stderr); exit(0);
+    }
+    int cseq = 1;
+    std::vector<unsigned char> resp;
+    tt_rtsp_request(sock, "GET", "/info", cseq++, NULL, 0, resp);
+    unsigned char fp1[16] = {0}; fp1[4] = 0x03; fp1[14] = 0x00;
+    tt_rtsp_request(sock, "POST", "/fp-setup", cseq++, fp1, sizeof(fp1), resp);
+    unsigned char fp2[164]; get_random_bytes(fp2, sizeof(fp2)); fp2[4] = 0x03;
+    tt_rtsp_request(sock, "POST", "/fp-setup", cseq++, fp2, sizeof(fp2), resp);
+    fairplay_t *myfp = fairplay_init(NULL);
+    unsigned char scratch142[142], scratch32[32];
+    fairplay_setup(myfp, fp1, scratch142);
+    fairplay_handshake(myfp, fp2, scratch32);
+
+    int csock = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in my_caddr; memset(&my_caddr, 0, sizeof(my_caddr));
+    my_caddr.sin_family = AF_INET;
+    my_caddr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    if (bind(csock, (struct sockaddr *) &my_caddr, sizeof(my_caddr)) < 0) {
+        fprintf(stderr, "RESEND-RECOVERY-CHECK: FAIL (bind failed: %s)\n", strerror(errno));
+        fflush(stderr); exit(0);
+    }
+    socklen_t my_caddr_len = sizeof(my_caddr);
+    getsockname(csock, (struct sockaddr *) &my_caddr, &my_caddr_len);
+    unsigned short my_cport = ntohs(my_caddr.sin_port);
+
+    unsigned char ekey[72], eiv[16], aeskey[16];
+    get_random_bytes(ekey, sizeof(ekey));
+    get_random_bytes(eiv, sizeof(eiv));
+    fairplay_decrypt(myfp, ekey, aeskey);
+
+    plist_t root = plist_new_dict();
+    plist_dict_set_item(root, "ekey", plist_new_data((const char *) ekey, sizeof(ekey)));
+    plist_dict_set_item(root, "eiv", plist_new_data((const char *) eiv, sizeof(eiv)));
+    plist_dict_set_item(root, "deviceID", plist_new_string("11:22:33:44:55:66"));
+    plist_dict_set_item(root, "timingProtocol", plist_new_string("None"));
+    plist_dict_set_item(root, "timingPort", plist_new_uint(0));
+    plist_t streams = plist_new_array();
+    plist_t stream = plist_new_dict();
+    plist_dict_set_item(stream, "type", plist_new_uint(96));
+    plist_dict_set_item(stream, "ct", plist_new_uint(8));
+    plist_dict_set_item(stream, "spf", plist_new_uint(480));
+    plist_dict_set_item(stream, "controlPort", plist_new_uint(my_cport));
+    plist_dict_set_item(stream, "audioFormat", plist_new_uint(0x1000000));
+    plist_dict_set_item(stream, "isMedia", plist_new_bool(1));
+    plist_dict_set_item(stream, "usingScreen", plist_new_bool(0));
+    plist_array_append_item(streams, stream);
+    plist_dict_set_item(root, "streams", streams);
+    std::vector<unsigned char> body;
+    tt_plist_to_bytes(root, body);
+    plist_free(root);
+
+    std::vector<unsigned char> setup_resp;
+    if (!tt_rtsp_request(sock, "SETUP", "rtsp://127.0.0.1/1", cseq++, body.data(), body.size(), setup_resp)) {
+        fprintf(stderr, "RESEND-RECOVERY-CHECK: FAIL (SETUP request failed)\n");
+        fflush(stderr); exit(0);
+    }
+    plist_t resp_plist = NULL;
+    plist_from_bin((const char *) setup_resp.data(), (uint32_t) setup_resp.size(), &resp_plist);
+    uint64_t dport = 0, server_cport = 0;
+    if (resp_plist) {
+        plist_t rstreams = plist_dict_get_item(resp_plist, "streams");
+        if (rstreams && plist_array_get_size(rstreams) > 0) {
+            plist_t rstream0 = plist_array_get_item(rstreams, 0);
+            plist_t dport_node = plist_dict_get_item(rstream0, "dataPort");
+            plist_t cport_node = plist_dict_get_item(rstream0, "controlPort");
+            if (dport_node) plist_get_uint_val(dport_node, &dport);
+            if (cport_node) plist_get_uint_val(cport_node, &server_cport);
+        }
+        plist_free(resp_plist);
+    }
+    if (!dport || !server_cport) {
+        fprintf(stderr, "RESEND-RECOVERY-CHECK: FAIL (no dataPort/controlPort in SETUP response)\n");
+        fflush(stderr); exit(0);
+    }
+
+    struct sockaddr_in csync_dest; memset(&csync_dest, 0, sizeof(csync_dest));
+    csync_dest.sin_family = AF_INET;
+    csync_dest.sin_port = htons((unsigned short) server_cport);
+    csync_dest.sin_addr.s_addr = inet_addr("127.0.0.1");
+    tt_send_sync_packet(csock, &csync_dest, true, 0, (uint64_t) time(NULL));
+    usleep(100000);
+
+    struct sockaddr_in dest; memset(&dest, 0, sizeof(dest));
+    dest.sin_family = AF_INET;
+    dest.sin_port = htons((unsigned short) dport);
+    dest.sin_addr.s_addr = inet_addr("127.0.0.1");
+    int asock = socket(AF_INET, SOCK_DGRAM, 0);
+    aes_ctx_t *enc = aes_cbc_init(aeskey, eiv, AES_ENCRYPT);
+
+    for (int p = 0; p < 5; p++) {
+        tt_send_audio_packet(asock, &dest, (unsigned short) p, (uint32_t) (p * 480), enc);
+        usleep(5000);
+    }
+    double gap_start = tt_now();
+    fprintf(stderr, "RESEND-RECOVERY-CHECK: SENT-GAP t=%.6f (seqnum 5-7 missing)\n", gap_start);
+
+    const double CHANNEL_COST_S = 0.008; /* 8ms per packet -- see function comment */
+    const double WINDOW_S = 4.0;
+    double channel_busy_until = 0.0;
+    bool recovered = false;
+    int keepalive_seqnum = 8;
+    double next_send = tt_now();
+    struct timeval tv; tv.tv_sec = 0; tv.tv_usec = 1000;
+    setsockopt(csock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    while (tt_now() - gap_start < WINDOW_S) {
+        double now = tt_now();
+        if (!recovered && now >= next_send) {
+            tt_send_audio_packet(asock, &dest, (unsigned short) keepalive_seqnum,
+                                  (uint32_t) (keepalive_seqnum * 480), enc);
+            keepalive_seqnum++;
+            next_send += 0.005;
+        }
+        unsigned char buf[64];
+        ssize_t n = recv(csock, buf, sizeof(buf), 0);
+        if (n == 8 && buf[1] == 0xD5) {
+            unsigned short req_seqnum = (unsigned short) ((buf[4] << 8) | buf[5]);
+            if (req_seqnum == 5) {
+                double t = tt_now();
+                channel_busy_until = (channel_busy_until > t ? channel_busy_until : t) + CHANNEL_COST_S;
+                fprintf(stderr, "RESEND-RECOVERY-CHECK: RECV-REQUEST t=%.6f channel_busy_until=%.6f\n", t, channel_busy_until);
+            }
+        }
+        if (!recovered && tt_now() >= channel_busy_until) {
+            tt_send_audio_packet(asock, &dest, 5, (uint32_t) (5 * 480), enc);
+            tt_send_audio_packet(asock, &dest, 6, (uint32_t) (6 * 480), enc);
+            tt_send_audio_packet(asock, &dest, 7, (uint32_t) (7 * 480), enc);
+            recovered = true;
+            double recovery_time = tt_now() - gap_start;
+            fprintf(stderr, "RESEND-RECOVERY-CHECK: RECOVERED t=%.6f recovery_time=%.6f\n", tt_now(), recovery_time);
+        }
+    }
+    if (!recovered) {
+        fprintf(stderr, "RESEND-RECOVERY-CHECK: NEVER-RECOVERED (channel modeled busy for the whole %.1fs window)\n", WINDOW_S);
+    }
 
     aes_cbc_destroy(enc);
     close(asock);
@@ -2666,6 +2859,8 @@ static void parse_arguments (int argc, char *argv[]) {
             do_ntp_resync_check = true;
         } else if (arg == "-resendstormcheck") {
             do_resend_storm_check = true;
+        } else if (arg == "-resendrecoverycheck") {
+            do_resend_recovery_check = true;
         } else if (arg == "-nohold") {
             nohold = 1;
         } else if (arg == "-al") {
@@ -4378,7 +4573,7 @@ int main (int argc, char *argv[]) {
      * 127.0.0.1:<raop_port> -- no mDNS discovery needed, and no
      * avahi/dns-sd daemon is expected to be available in the minimal
      * container this is meant to run in (see docs/threadtest.md). */
-    if (!do_threadtest && !do_ntp_resync_check && !do_resend_storm_check && register_dnssd()) {
+    if (!do_threadtest && !do_ntp_resync_check && !do_resend_storm_check && !do_resend_recovery_check && register_dnssd()) {
         stop_raop_server();
         stop_dnssd();
         cleanup();
@@ -4396,6 +4591,10 @@ int main (int argc, char *argv[]) {
     if (do_resend_storm_check) {
         setenv("UX_THREADTEST_DIAG", "1", 1);
         g_thread_new("resend-storm-check", threadtest_resend_storm_check, NULL);
+    }
+    if (do_resend_recovery_check) {
+        setenv("UX_THREADTEST_DIAG", "1", 1);
+        g_thread_new("resend-recovery-check", threadtest_resend_recovery_check, NULL);
     }
     reconnect:
     compression_type = 0;
