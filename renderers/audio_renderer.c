@@ -510,14 +510,15 @@ void audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned s
              * if gst_app_src_end_of_stream() was called on this appsrc (via
              * audio_renderer_stop(), on every RAOP disconnect/reconnect
              * cycle) and something about the following state transition
-             * didn't fully clear that internally. Previously this failure
-             * was completely silent: audio would just stop forever, with
-             * zero log trace, recoverable only by the client tearing down
-             * and re-establishing the whole AirPlay session from scratch
-             * (which goes through the exact same audio_renderer_stop()/
-             * audio_renderer_start() pair below, just triggered
-             * externally). Self-heal the same way here instead of waiting
-             * on the user to notice and manually reconnect. */
+             * didn't fully clear that internally. Without a self-heal here
+             * this failure is completely silent: audio just stops forever,
+             * with zero log trace, recoverable only by the client tearing
+             * down and re-establishing the whole AirPlay session from
+             * scratch (which goes through the exact same
+             * audio_renderer_stop()/audio_renderer_start() pair below,
+             * just triggered externally). Self-heal the same way here
+             * instead of waiting on the user to notice and manually
+             * reconnect. */
             logger_log(logger, LOGGER_ERR, "*** ERROR gst_app_src_push_buffer failed, GstFlowReturn = %d (%s); restarting audio renderer",
                        ret, gst_flow_get_name(ret));
             /* Deferred (see audio_renderer_self_heal_deferred()'s own

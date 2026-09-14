@@ -695,8 +695,8 @@ static void read_overscan_conf(int *left, int *right, int *top, int *bottom) {
  * uxplay.cpp) and again every time the config file changes (see the
  * GFileMonitor set up in uxplay.cpp's main_loop()). render-rectangle is a
  * plain GObject property on kmssink, and GStreamer supports changing it on
- * a running pipeline -- confirmed live earlier this session via GST_DEBUG
- * ("Setting render rectangle to ..."). The margin itself renders as solid
+ * a running pipeline (confirmed via GST_DEBUG: "Setting render rectangle
+ * to ..."). The margin itself renders as solid
  * black because the DRM primary plane underneath is kept zeroed
  * (/usr/local/bin/zero-fb0), not because anything here paints it. */
 void video_renderer_apply_overscan(void) {
@@ -897,17 +897,15 @@ static GThread *g_blank_display_thread = NULL;
  * check). video_renderer_blank_display() blocks for up to ~4s in the
  * worst case (2s waiting for the blank pipeline to reach PLAYING/EOS,
  * another 2s waiting for it to reach NULL) -- calling it synchronously
- * stalled that thread long enough to trip the client-silence timeout,
- * which triggered ANOTHER reconnect, which triggered ANOTHER blocking
- * blank call: a self-sustaining reconnect storm, confirmed on the real
- * device (rapid connect/disconnect cycling, "3 seconds since last
- * client feedback" warnings, immediately after this blanking fix was
- * deployed). Run it on its own thread instead so it can't stall
- * anything else. video_renderer_init() joins any pending blank thread
- * before proceeding (see there) so this doesn't reopen the DRM-master
- * race the synchronous wait was originally added to close -- the
- * asynchrony is only with respect to OTHER work (protocol timers),
- * never with respect to the next pipeline actually being built. */
+ * here would stall that thread long enough to trip the client-silence
+ * timeout, triggering another reconnect, which would call this again:
+ * a self-sustaining reconnect storm. Run it on its own thread instead
+ * so it can't stall anything else. video_renderer_init() joins any
+ * pending blank thread before proceeding (see there), so the DRM-master
+ * race a synchronous wait guards against is still closed -- the
+ * asynchrony introduced here is only with respect to OTHER work
+ * (protocol timers), never with respect to the next pipeline actually
+ * being built. */
 static void video_renderer_join_pending_blank(void) {
     if (g_blank_display_thread) {
         g_thread_join(g_blank_display_thread);
@@ -995,9 +993,8 @@ static void video_renderer_blank_display() {
      * shortly after this function returns, via video_renderer_init() in
      * uxplay.cpp's post-main_loop relaunch block) can start trying to
      * grab DRM master while this one is still asynchronously releasing
-     * it -- confirmed as a real regression: video stopped playing after
-     * any re-mirror once this blanking step was added, exactly the
-     * signature of a lost DRM-master race. */
+     * it -- the signature of that race is video not playing after any
+     * re-mirror. */
     gst_element_get_state(blank, NULL, NULL, 2 * GST_SECOND);
     gst_object_unref(blank);
 }

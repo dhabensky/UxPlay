@@ -1,11 +1,12 @@
 /* Regression/unit test for raop_should_teardown_existing_connection()
- * (lib/raop_conn_policy.c) -- the 2026-09-13 fix for
- * bugs/2026-09-13-audio-dies-on-repeated-track-switch-setup.md.
+ * (lib/raop_conn_policy.c) -- see the main repo's
+ * docs/bugs/2026-09-13-audio-dies-on-repeated-track-switch-setup.md for
+ * the bug this function fixes.
  *
  * Deliberately depends on NOTHING beyond the one function under test --
  * no GStreamer, no hardware, no network, no httpd_t/raop_t mocking. This
- * is exactly why the fix logic was extracted into its own tiny,
- * dependency-free file rather than left inline in raop.c's much larger,
+ * is exactly why this logic lives in its own tiny, dependency-free file
+ * rather than inline in raop.c's much larger,
  * more entangled conn_request(): raop.c pulls in raop_handlers.h (huge)
  * plus pairing/fairplay/httpd, which would make a directly-included-.c
  * test (the pattern test_bus_callback_null_renderer.c uses) impractical

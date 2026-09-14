@@ -742,8 +742,8 @@ static gpointer threadtest_driver(gpointer data) {
         if (cycle == 0) {
             /* Only the very FIRST SETUP on a connection carries ekey/eiv
              * (raop_handlers.h:630's "first SETUP" branch) -- matching every
-             * real capture this session: "SETUP 1" logged exactly once per
-             * connection, never on the later same-connection restarts. */
+             * real capture: "SETUP 1" logged exactly once per connection,
+             * never on the later same-connection restarts. */
             plist_dict_set_item(root, "ekey", plist_new_data((const char *) ekey, sizeof(ekey)));
             plist_dict_set_item(root, "eiv", plist_new_data((const char *) eiv, sizeof(eiv)));
             plist_dict_set_item(root, "deviceID", plist_new_string("11:22:33:44:55:66"));
@@ -830,9 +830,9 @@ static gpointer threadtest_driver(gpointer data) {
          * -- UX_THREADTEST_GAP_S (seconds, default 0) simulates a real
          * inter-cycle gap, testing whether a long-idle pipeline (queue/
          * avdec_aac/alsasink left running in PLAYING the whole time, per
-         * this fix's own approach -- see audio_renderer_start()'s "same-ct
-         * restart" branch) resumes cleanly after real starvation, not just
-         * after the sub-second gap rapid cycling leaves. */
+         * audio_renderer_start()'s "same-ct restart" branch) resumes
+         * cleanly after real starvation, not just after the sub-second gap
+         * rapid cycling leaves. */
         const char *gap_env = g_getenv("UX_THREADTEST_GAP_S");
         int gap = gap_env ? atoi(gap_env) : 0;
         /* Real clients send POST /feedback roughly every 2s; without it the
@@ -909,8 +909,8 @@ static bool mux_to_file = false;
 static std::string mux_filename = "recording";
 
 /* forward-declared above replay_feeder; see comment there.
- * UX_RECONNECT_MODE: "full" (default, matches pre-fix live main_loop
- * behavior) tears down and rebuilds the whole video pipeline (closes+reopens
+ * UX_RECONNECT_MODE: "full" (default, matches live main_loop's actual
+ * reconnect behavior) tears down and rebuilds the whole video pipeline (closes+reopens
  * the v4l2h264dec hardware decoder's /dev/video10); "stop" only drops the
  * pipeline to GST_STATE_NULL (still closes the device, since v4l2h264dec
  * closes on READY->NULL) and lets choose_codec bring it back; "none" never
@@ -1461,14 +1461,12 @@ static gboolean dnssd_refresh_callback (gpointer loop) {
      * implement the full DNSServiceRegister async-callback/event-loop
      * machinery this codebase doesn't otherwise use anywhere.
      *
-     * Uses dnssd_reregister(), NOT unregister_dnssd()+register_dnssd() --
-     * that combination was tried first and caused a severe regression:
+     * Uses dnssd_reregister(), NOT unregister_dnssd()+register_dnssd():
      * unregister_dnssd() frees dnssd->name/hw_addr once both services are
      * unregistered (fine when followed by dnssd_destroy(), a real
-     * use-after-free when followed by registering again moments later).
-     * That corrupted the heap and crashed the whole process with SIGABRT
-     * every 5 minutes on the live device (confirmed via systemd's restart
-     * counter climbing continuously) until caught and fixed here.
+     * use-after-free -- heap corruption, SIGABRT -- when followed by
+     * registering again moments later, exactly what a periodic refresh
+     * needs to do).
      */
     dnssd_reregister(dnssd, raop_port, airplay_port);
     return TRUE;
@@ -1541,9 +1539,9 @@ static void main_loop()  {
     guint sigint_watch_id = g_unix_signal_add(SIGINT, (GSourceFunc) sigint_callback, (gpointer) loop);
     guint sighup_watch_id = g_unix_signal_add(SIGHUP, (GSourceFunc) sigint_callback, (gpointer) loop);
     /* Registered once here, for the whole process lifetime (main_loop() is
-     * only ever called once from main(), not per-connection -- confirmed
-     * this session) rather than per-client, so overscan is tunable live
-     * whether or not anyone is currently mirroring. */
+     * only ever called once from main(), not per-connection) rather than
+     * per-client, so overscan is tunable live whether or not anyone is
+     * currently mirroring. */
     GFile *overscan_conf_file = g_file_new_for_path("/etc/default/uxplay");
     GError *overscan_monitor_error = NULL;
     GFileMonitor *overscan_conf_monitor = g_file_monitor_file(overscan_conf_file, G_FILE_MONITOR_NONE, NULL, &overscan_monitor_error);
@@ -2995,14 +2993,12 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
         LOGD("video_reset: type = RTP_Shutdown");
         if (use_video) {
             if (!hls_support && !preserve_connections) {
-                /* Reverted an attempt to always video_renderer_stop() here
-                 * (to fix a frozen-last-frame info-disclosure bug on
-                 * explicit "Stop Mirroring") -- it broke re-mirroring
-                 * entirely (confirmed on real hardware: video never
-                 * started again after a subsequent connection). This
-                 * skip_video_rebuild fast path is load-bearing, exercised
-                 * by the replay/reconnect test tooling (see the comment
-                 * near replay_do_reconnect), not safe to remove casually.
+                /* Calling video_renderer_stop() unconditionally here breaks
+                 * re-mirroring entirely (video never starts again after a
+                 * subsequent connection) -- this skip_video_rebuild fast
+                 * path is load-bearing, exercised by the replay/reconnect
+                 * test tooling (see the comment near replay_do_reconnect),
+                 * not safe to remove casually.
                  * Plain mirror-mode reconnect: leave the pipeline running
                  * instead of stopping it, so the post-main_loop block below
                  * doesn't need to destroy+recreate it. The next connection's
@@ -3354,8 +3350,8 @@ extern "C" void audio_get_format (void *cls, unsigned char *ct, unsigned short *
       /* Deferred to the main thread's GMainLoop (see
        * audio_renderer_start_deferred()'s own comment in audio_renderer.c):
        * audio_get_format() runs on the httpd thread (called inline from a
-       * SETUP request's handler), which used to call the synchronous
-       * audio_renderer_start() directly -- a real, unsynchronized race
+       * SETUP request's handler) -- calling the synchronous
+       * audio_renderer_start() directly here would race, unsynchronized,
        * against the RAOP audio thread's own self-heal path touching the
        * same renderer/pipeline state. */
       if (do_threadtest) fprintf(stderr, "threadtest: httpd-thread QUEUE-DEFERRED-START t=%.6f\n", tt_now());

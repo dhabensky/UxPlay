@@ -9,8 +9,7 @@
  * directly (its `renderer` global and callback are `static`), synthesizes a
  * real GstMessage of type ERROR on a real (pipeline-less) GstBus, and calls
  * the bus callback exactly as GLib's main loop would -- with `renderer`
- * left at its default NULL. Before the fix this segfaults; after the fix
- * it must return normally.
+ * left at its default NULL. Must return normally, not segfault.
  */
 #include <gst/gst.h>
 #include <stdarg.h>
@@ -30,11 +29,9 @@ void logger_log(logger_t *logger, int level, const char *fmt, ...) {
 }
 
 /* Minimal stub: the real implementation lives in video_renderer.c, which
- * this test has no reason to link against (2026-09-13: found while
- * finally wiring this test into an actual build/runner for the first
- * time -- see the main repo's Dockerfile, unit-tests stage). Never
- * actually invoked by this test (audio_renderer_init() itself is never
- * called here), just needs to exist to satisfy the linker. */
+ * this test has no reason to link against. Never actually invoked by
+ * this test (audio_renderer_init() itself is never called here), just
+ * needs to exist to satisfy the linker. */
 void install_av_sync_probe(GstElement *pipeline) {
     (void) pipeline;
 }
