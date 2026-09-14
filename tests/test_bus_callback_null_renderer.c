@@ -32,9 +32,9 @@ void logger_log(logger_t *logger, int level, const char *fmt, ...) {
 /* Minimal stub: the real implementation lives in video_renderer.c, which
  * this test has no reason to link against (2026-09-13: found while
  * finally wiring this test into an actual build/runner for the first
- * time -- see Dockerfile.unit-tests). Never actually invoked by this
- * test (audio_renderer_init() itself is never called here), just needs
- * to exist to satisfy the linker. */
+ * time -- see the main repo's Dockerfile, unit-tests stage). Never
+ * actually invoked by this test (audio_renderer_init() itself is never
+ * called here), just needs to exist to satisfy the linker. */
 void install_av_sync_probe(GstElement *pipeline) {
     (void) pipeline;
 }
