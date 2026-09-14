@@ -783,20 +783,55 @@ static gpointer threadtest_driver(gpointer data) {
 
         plist_t resp_plist = NULL;
         plist_from_bin((const char *) setup_resp.data(), (uint32_t) setup_resp.size(), &resp_plist);
-        uint64_t dport = 0;
+        uint64_t dport = 0, cport = 0;
         if (resp_plist) {
             plist_t rstreams = plist_dict_get_item(resp_plist, "streams");
             if (rstreams && plist_array_get_size(rstreams) > 0) {
                 plist_t rstream0 = plist_array_get_item(rstreams, 0);
                 plist_t dport_node = plist_dict_get_item(rstream0, "dataPort");
+                plist_t cport_node = plist_dict_get_item(rstream0, "controlPort");
                 if (dport_node) plist_get_uint_val(dport_node, &dport);
+                if (cport_node) plist_get_uint_val(cport_node, &cport);
             }
             plist_free(resp_plist);
         }
-        if (!dport) {
-            fprintf(stderr, "threadtest: cycle %d got no dataPort in SETUP response, aborting\n", cycle);
+        if (!dport || !cport) {
+            fprintf(stderr, "threadtest: cycle %d got no dataPort/controlPort in SETUP response, aborting\n", cycle);
             break;
         }
+
+        /* raop_rtp.c's dequeue loop only dispatches to audio_process() once
+         * initial_sync is true (a deliberate cold-start guard, reset on
+         * every restart -- see docs/audio-pipeline.md), so a real sync
+         * packet is required every cycle before any audio packet below can
+         * ever be rendered -- without this, every packet sent below would
+         * sit in the jitter buffer forever and RENDER-BUFFER-CALL/
+         * DECODED-BUFFER-OUT would never fire (confirmed empirically: this
+         * was missing originally and every cycle silently rendered
+         * nothing). Same call/timing pattern as threadtest_ntp_resync_check
+         * above, first=true only for the very first sync of the
+         * connection. */
+        struct sockaddr_in csync_dest; memset(&csync_dest, 0, sizeof(csync_dest));
+        csync_dest.sin_family = AF_INET;
+        csync_dest.sin_port = htons((unsigned short) cport);
+        csync_dest.sin_addr.s_addr = inet_addr("127.0.0.1");
+        int csock = socket(AF_INET, SOCK_DGRAM, 0);
+        /* Sent twice, 20ms apart: this is a fire-and-forget UDP send with
+         * no ACK/retry (unlike a real client's periodic RTCP sync), so a
+         * single lost packet over loopback would silently starve this
+         * entire cycle's audio (raop_rtp.c never dispatches anything until
+         * initial_sync is true) -- observed directly in a 50-cycle stress
+         * run: one cycle in 34 got no RENDER-BUFFER-CALL at all, isolated,
+         * no slowdown before it. This is test-driver robustness only, not
+         * a production code change. */
+        tt_send_sync_packet(csock, &csync_dest, cycle == 0, (uint32_t) (cycle * 1000 * 480),
+                             (uint64_t) time(NULL));
+        usleep(20000);
+        tt_send_sync_packet(csock, &csync_dest, cycle == 0, (uint32_t) (cycle * 1000 * 480),
+                             (uint64_t) time(NULL));
+        close(csock);
+        fprintf(stderr, "threadtest: cycle %d SENT-SYNC t=%.6f\n", cycle, tt_now());
+        usleep(100000); /* let the server process the sync packet, matching threadtest_ntp_resync_check */
 
         int asock = socket(AF_INET, SOCK_DGRAM, 0);
         struct sockaddr_in dest; memset(&dest, 0, sizeof(dest));
@@ -825,6 +860,7 @@ static gpointer threadtest_driver(gpointer data) {
         std::vector<unsigned char> td_resp;
         fprintf(stderr, "threadtest: cycle %d SEND-TEARDOWN t=%.6f\n", cycle, tt_now());
         tt_rtsp_request(sock, "TEARDOWN", "rtsp://127.0.0.1/1", cseq++, td_body.data(), td_body.size(), td_resp);
+        fprintf(stderr, "threadtest: cycle %d RECV-TEARDOWN-response t=%.6f\n", cycle, tt_now());
 
         /* Real track switches are seconds to minutes apart, not milliseconds
          * -- UX_THREADTEST_GAP_S (seconds, default 0) simulates a real
