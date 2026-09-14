@@ -835,26 +835,38 @@ static gpointer threadtest_resend_storm_check(gpointer data) {
     }
     fprintf(stderr, "RESEND-STORM-CHECK: SENT-GAP t=%.6f (seqnum 5-7 never sent)\n", tt_now());
 
-    /* Keep sending packets past the gap (seqnum 8 onward) roughly every
-     * 5ms for the whole window below -- this is what actually drives the
-     * server's select() loop to wake up and re-check
-     * raop_buffer_handle_resends() at all (its timeout branch does a bare
-     * `continue`, skipping that check entirely -- confirmed by an earlier,
-     * simpler version of this test that stopped sending after a short
-     * burst and only caught ~32 requests instead of the flood a
-     * real ~2.8s dropout shows; a real client's own repeated resend
-     * *responses* play this same "keep the loop awake" role, which this
-     * synthetic client deliberately never sends, by design -- see the
-     * function-level comment above). Count resend-request packets
-     * arriving on our bound control socket concurrently -- 8 bytes,
-     * packet[1]==0xD5 per raop_rtp_resend_callback()'s own wire format
+    /* Keep sending packets past the gap (seqnum 8 onward) at AAC-ELD's
+     * real cadence (spf=480 @ 44100Hz =~ 10.884ms/packet) for the whole
+     * window below -- this is what actually drives the server's
+     * select() loop to wake up and re-check raop_buffer_handle_resends()
+     * at all (its timeout branch does a bare `continue`, skipping that
+     * check entirely). Matching the real cadence matters here, not just
+     * for realism: an earlier version of this test used an arbitrary 5ms
+     * interval, which made the buffer's capacity threshold (256 entries)
+     * get reached in ~1.27s instead of the real ~2.79s the actual cadence
+     * produces -- confirmed by comparing against a real capture's
+     * observed ~2.8s dropout (see
+     * docs/bugs/2026-09-14-audio-resume-latency-on-seek.md). A real
+     * client's own repeated resend *responses* would also keep the loop
+     * awake at a similar rate, which this synthetic client deliberately
+     * never sends, by design -- see the function-level comment above.
+     * Count resend-request packets arriving on our bound control socket
+     * concurrently -- 8 bytes, packet[1]==0xD5 per
+     * raop_rtp_resend_callback()'s own wire format
      * (0x80 | (0x55|0x80) == 0xD5), referencing seqnum 5 (the first
      * missing one). */
     int resend_request_count = 0;
     int keepalive_seqnum = 8;
     double window_start = tt_now();
-    const double window_s = 1.0;
+    const double keepalive_interval_s = 480.0 / 44100.0;
+    /* 3.5s: long enough to see raop_buffer_dequeue()'s capacity-based
+     * force-skip actually resolve the gap (256-entry buffer at real
+     * AAC-ELD cadence needs ~2.79s -- see
+     * docs/bugs/2026-09-14-audio-resume-latency-on-seek.md) and go quiet
+     * again, not just the request-rate window the count alone measures. */
+    const double window_s = 3.5;
     double next_send = window_start;
+    double last_request_t = -1.0; /* -1: never received one at all */
     struct timeval tv; tv.tv_sec = 0; tv.tv_usec = 2000;
     setsockopt(csock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     while (tt_now() - window_start < window_s) {
@@ -863,7 +875,7 @@ static gpointer threadtest_resend_storm_check(gpointer data) {
             tt_send_audio_packet(asock, &dest, (unsigned short) keepalive_seqnum,
                                   (uint32_t) (keepalive_seqnum * 480), enc);
             keepalive_seqnum++;
-            next_send += 0.005;
+            next_send += keepalive_interval_s;
         }
         unsigned char buf[64];
         ssize_t n = recv(csock, buf, sizeof(buf), 0);
@@ -871,11 +883,22 @@ static gpointer threadtest_resend_storm_check(gpointer data) {
             unsigned short req_seqnum = (unsigned short) ((buf[4] << 8) | buf[5]);
             if (req_seqnum == 5) {
                 resend_request_count++;
+                last_request_t = tt_now() - window_start;
             }
         }
     }
+    /* RESOLVED-AT is the real recovery-time metric (the same signal used
+     * to correctly read the real capture's resolution time in this
+     * investigation): once the server stops asking for seqnum 5 at all,
+     * either a genuine resend succeeded or raop_buffer_dequeue() force-
+     * skipped past it -- either way, the stall is over. RESEND-REQUEST-
+     * COUNT alone doesn't distinguish "asks a lot but takes ~2.8s to give
+     * up" from "asks a lot and recovers fast" -- confirmed empirically:
+     * the resend-rate-limit fix cut this count ~30x on a real capture
+     * with zero change to the actual ~2.8s dropout duration. */
     fprintf(stderr, "RESEND-STORM-CHECK: RESEND-REQUEST-COUNT %d (in %.1fs, sent %d keepalive packets)\n",
             resend_request_count, window_s, keepalive_seqnum - 8);
+    fprintf(stderr, "RESEND-STORM-CHECK: RESOLVED-AT %.4f\n", last_request_t);
 
     aes_cbc_destroy(enc);
     close(asock);
