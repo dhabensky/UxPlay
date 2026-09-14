@@ -4440,6 +4440,16 @@ int main (int argc, char *argv[]) {
 }
  
 static void cleanup() {
+    if (mux_to_file) {
+        /* Without this, exit(0) below kills the mux pipeline before it
+         * ever sends EOS through mp4mux -- the moov atom (index) never
+         * gets written, so the output file doesn't just end up truncated,
+         * it never even appears at all (confirmed: -replay ... -mp4 out.mp4
+         * completing cleanly with "replay: done" left zero bytes on disk
+         * until this call was added). Every other mux_to_file teardown
+         * path in this file already calls this; this one was missing it. */
+        mux_renderer_stop();
+    }
     if (use_audio) {
         audio_renderer_destroy();
     }

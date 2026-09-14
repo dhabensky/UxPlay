@@ -187,9 +187,16 @@ void mux_renderer_choose_audio_codec(unsigned char audio_ct) {
         logger_log(logger, LOGGER_DEBUG, "Audio codec changed, recreating mux renderer");
         mux_renderer_destroy();
     }
-    if (audio_ct == 2) {
-        mux_renderer_start();
-    }
+    /* Unconditional, matching mux_renderer_choose_video_codec() below --
+     * mux_renderer_start() is idempotent (no-ops if a pipeline already
+     * exists), so this is safe to call from both codec-choice paths for a
+     * normal mirroring session. Previously gated on audio_ct==2 (ALAC)
+     * only, on the assumption that an AAC-ELD (mirroring) session always
+     * also negotiates a video codec, which is what actually started the
+     * muxer -- true with real video rendering, but not when video is
+     * disabled entirely (no_video, e.g. `-vs 0`): a mirroring capture's
+     * ct=8 audio then never gets muxed to a file at all. */
+    mux_renderer_start();
 }
 
 /* called by video_set_codec calback in uxplay.cpp, from raop_rtp_mirror */
