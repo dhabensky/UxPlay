@@ -537,9 +537,11 @@ static void tt_send_sync_packet(int sock, struct sockaddr_in *dest, bool first,
  * This prints plain timestamped markers (SENT-PROBE-A/SENT-SYNC-2/
  * SENT-PROBE-B) and relies on the existing RENDER-BUFFER-CALL diagnostic
  * (renderers/audio_renderer.c) for timing -- the actual PASS/FAIL verdict
- * is computed by tools/test-audio-ntp-resync-e2e.sh from the combined
- * log's timestamps, which also runs this against both an old and a new
- * build and asserts fail-old/pass-new. */
+ * is computed by tools/pytest/test_ntp_resync.py (main repo) from the
+ * combined log's timestamps. Its --uxplay-ref option can point that test
+ * at an old build instead of the current working tree, for an explicit
+ * fail-old/pass-new comparison; a plain run only tests whichever
+ * revision is currently checked out. */
 static gpointer threadtest_ntp_resync_check(gpointer data) {
     (void) data;
     sleep(1);
