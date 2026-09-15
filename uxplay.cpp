@@ -1336,6 +1336,17 @@ static guint gst_hls_position_id = 0;
 static bool preserve_connections = false;
 static guint missed_feedback_limit = MISSED_FEEDBACK_LIMIT;
 static guint missed_feedback = 0;
+/* Render-health watchdog: recovers from a decode-without-render collapse
+ * (see docs/bugs/2026-09-14-video-render-collapse.md) in a few seconds,
+ * instead of relying on feedback_callback's client-silence timeout above,
+ * which can take up to -reset N seconds and won't fire at all if the client
+ * keeps sending feedback while only video is stuck (audio can still be
+ * flowing fine). Opt out with -norenderhealthcheck. */
+#define RENDER_HEALTH_STALL_LIMIT 3  /* consecutive 1-second checks of decode-without-render before recovering */
+static bool render_health_check = true;
+static guint render_health_stall_count = 0;
+static int render_health_last_decode = 0;
+static int render_health_last_render = 0;
 static guint playbin_version = DEFAULT_PLAYBIN_VERSION;
 static bool reset_httpd = false;
 static bool monitor_progress = false;
@@ -1760,6 +1771,39 @@ static gboolean feedback_callback(gpointer loop) {
     return TRUE;
 }
 
+static gboolean render_health_callback(gpointer loop) {
+    if (!render_health_check || !open_connections) {
+        render_health_stall_count = 0;
+        render_health_last_decode = video_renderer_get_decode_count();
+        render_health_last_render = video_renderer_get_render_count();
+        return TRUE;
+    }
+    int decode = video_renderer_get_decode_count();
+    int render = video_renderer_get_render_count();
+    bool decoding = (decode != render_health_last_decode);
+    bool rendering = (render != render_health_last_render);
+    render_health_last_decode = decode;
+    render_health_last_render = render;
+    if (decoding && !rendering) {
+        render_health_stall_count++;
+        if (render_health_stall_count >= RENDER_HEALTH_STALL_LIMIT) {
+            LOGI("***ERROR video render collapse: decoder is producing frames (count=%d) but nothing has "
+                 "reached the display in %u seconds -- forcing a video pipeline reset", decode, render_health_stall_count);
+            reset_httpd = true;
+            relaunch_video = true;
+            full_video_reset = true;
+            g_main_loop_quit((GMainLoop *) loop);
+            return TRUE;
+        }
+    } else {
+        /* Either both sides are progressing (healthy), or both are idle
+         * (legitimately static mirrored content, not a collapse) -- either
+         * way, this isn't the stall signature, so the streak resets. */
+        render_health_stall_count = 0;
+    }
+    return TRUE;
+}
+
 static gboolean reset_callback(gpointer loop) {
     if (reset_loop) {
         g_main_loop_quit((GMainLoop *) loop);
@@ -1972,7 +2016,11 @@ static void main_loop()  {
     }
 
     missed_feedback = 0;
+    render_health_stall_count = 0;
+    render_health_last_decode = 0;
+    render_health_last_render = 0;
     guint feedback_watch_id = g_timeout_add_seconds(1, (GSourceFunc) feedback_callback, (gpointer) loop);
+    guint render_health_watch_id = g_timeout_add_seconds(1, (GSourceFunc) render_health_callback, (gpointer) loop);
     guint reset_watch_id = g_timeout_add(100, (GSourceFunc) reset_callback, (gpointer) loop);
     guint dnssd_refresh_watch_id = g_timeout_add_seconds(300, (GSourceFunc) dnssd_refresh_callback, (gpointer) loop);
 
@@ -2030,6 +2078,7 @@ static void main_loop()  {
     if (progress_id > 0) g_source_remove(progress_id);
     if (video_eos_watch_id > 0) g_source_remove(video_eos_watch_id);
     if (feedback_watch_id > 0) g_source_remove(feedback_watch_id);
+    if (render_health_watch_id > 0) g_source_remove(render_health_watch_id);
     if (dnssd_refresh_watch_id > 0) g_source_remove(dnssd_refresh_watch_id);
     g_main_loop_unref(loop);
 }    
@@ -2256,6 +2305,8 @@ static void print_info (char *name) {
     printf("-md <fn>  In Airplay Audio (ALAC) mode, write metadata text to file <fn>\n");
     printf("-reset n  Reset after n seconds of client silence (default n=%d, 0=never)\n", MISSED_FEEDBACK_LIMIT);
     printf("-nofreeze Do NOT leave frozen screen in place after reset\n");
+    printf("-norenderhealthcheck  Do NOT auto-reset when video decodes but never\n");
+    printf("          renders (default: on, recovers within %d seconds)\n", RENDER_HEALTH_STALL_LIMIT);
     printf("-nc       Do NOT  Close video window when client stops mirroring\n");
     printf("-nc no    Cancel the -nc option (DO close video window) \n");
     printf("-nohold   Drop current connection when new client connects.\n");
@@ -3033,6 +3084,8 @@ static void parse_arguments (int argc, char *argv[]) {
             h265_support = true;
         } else if (arg == "-nofreeze") {
             nofreeze = true;
+        } else if (arg == "-norenderhealthcheck") {
+            render_health_check = false;
         } else {
             fprintf(stderr, "unknown option %s, stopping (for help use option \"-h\")\n",argv[i]);
             exit(1);
