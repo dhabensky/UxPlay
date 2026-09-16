@@ -42,13 +42,35 @@
  * wakes it -- with no rate limiting, this fires a brand new duplicate
  * resend request every single time a packet stays missing, which floods
  * both directions of the control channel exactly when the network is
- * already struggling (see docs/bugs/2026-09-14-audio-resume-latency-on-seek.md,
- * confirmed empirically: ~760 duplicate requests per ~2.8s real audio
- * dropout, and separately via tools/test-audio-resend-storm-e2e.sh's
- * 1:1 packet-to-request ratio before this fix). Does not change the
- * *first* request for a given gap -- only suppresses repeat firing for
- * the *same* gap within this interval.*/
+ * already struggling. Reduces redundant control-channel traffic (real,
+ * confirmed via a ~30x cut in a real capture) but does NOT by itself
+ * bound how long a stall can last -- that turned out to be governed
+ * entirely by RAOP_STALL_TIMEOUT_NS below, independent of request
+ * volume: a real deploy of this fix alone had zero effect on the actual
+ * ~2.8s dropout duration (see
+ * docs/bugs/2026-09-14-audio-resume-latency-on-seek.md's "second root
+ * cause" section). Does not change the *first* request for a given gap
+ * -- only suppresses repeat firing for the *same* gap within this
+ * interval. */
 #define RAOP_RESEND_MIN_INTERVAL_NS 100000000ULL /* 100ms */
+
+/* raop_buffer_dequeue() normally refuses to skip a missing packet at the
+ * front of the buffer until the full RAOP_BUFFER_LENGTH capacity is
+ * exhausted -- necessary so ordinary jitter/reordering doesn't stutter
+ * (RAOP_BUFFER_LENGTH itself was raised 32->256 upstream specifically to
+ * fix that class of bug, see git log), but at AAC-ELD's real ~10.9ms/
+ * packet cadence (spf=480 @ 44100Hz), waiting for 256 entries to fill
+ * takes ~2.79s -- this, not resend request volume, is what actually
+ * bounds the real ~2.8s audio dropout on a lost packet. This timeout is
+ * orthogonal to that capacity limit, not a replacement for it: once a
+ * slot has been stuck this long, force-skip it regardless of how full
+ * the buffer is. 200ms leaves real margin under the 500ms requirement
+ * while still giving 1-2 real resend round-trips a fair chance under
+ * normal (non-adversarial) conditions -- ordinary jitter/reordering
+ * resolves in single-digit-to-tens of ms, well under this, so it
+ * shouldn't interact with the ALAC-stuttering fix's normal-case behavior
+ * at all. */
+#define RAOP_STALL_TIMEOUT_NS 200000000ULL /* 200ms */
 
 typedef struct {
     /* Data available */
@@ -83,6 +105,16 @@ struct raop_buffer_s {
     bool last_resend_requested;
     unsigned short last_resend_first_seqnum;
     uint64_t last_resend_request_ns;
+
+    /* Stall-timeout force-skip (see RAOP_STALL_TIMEOUT_NS above). Same
+     * "explicit bool, not a sentinel value" reasoning as the pair above.
+     * Reset (stalled = false) whenever first_seqnum's slot is genuinely
+     * filled by a successful dequeue, or on a flush -- NOT after every
+     * force-skip, so a multi-packet gap gets skipped in one burst once
+     * the timeout is reached rather than needing the full timeout again
+     * per packet. */
+    bool stalled;
+    uint64_t stall_since_ns;
 
     /* RTP buffer entries */
     raop_buffer_entry_t entries[RAOP_BUFFER_LENGTH];
@@ -265,12 +297,28 @@ raop_buffer_dequeue(raop_buffer_t *raop_buffer, unsigned int *length, uint32_t *
     if (no_resend) {
         /* If we do no resends, always return the first entry */
     } else if (!entry->filled) {
+        /* See RAOP_STALL_TIMEOUT_NS above: bound how long this specific
+         * slot can block progress, independent of how much room is left
+         * in the buffer. */
+        struct timespec now_ts;
+        clock_gettime(CLOCK_MONOTONIC, &now_ts);
+        uint64_t now_ns = (uint64_t) now_ts.tv_sec * 1000000000ULL + (uint64_t) now_ts.tv_nsec;
+        if (!raop_buffer->stalled) {
+            raop_buffer->stalled = true;
+            raop_buffer->stall_since_ns = now_ns;
+        }
+        bool stalled_too_long = (now_ns - raop_buffer->stall_since_ns) >= RAOP_STALL_TIMEOUT_NS;
         /* Check how much we have space left in the buffer */
-        if (entry_count < RAOP_BUFFER_LENGTH) {
+        if (entry_count < RAOP_BUFFER_LENGTH && !stalled_too_long) {
             /* Return nothing and hope resend gets on time */
             return NULL;
         }
-        /* Risk of buffer overrun, return empty buffer */
+        /* Risk of buffer overrun, or stuck too long -- force past this
+         * entry either way. Deliberately do NOT reset raop_buffer->stalled
+         * here: if the next entry is also unfilled, the timeout has
+         * already elapsed for it too, so a multi-packet gap gets skipped
+         * in one burst rather than needing the full timeout again per
+         * entry. */
     }
 
     /* Update buffer and validate entry */
@@ -279,6 +327,7 @@ raop_buffer_dequeue(raop_buffer_t *raop_buffer, unsigned int *length, uint32_t *
         return NULL;
     }
     entry->filled = 0;
+    raop_buffer->stalled = false;
 
     /* Return entry payload buffer */
     *rtp_timestamp = entry->rtp_timestamp;
