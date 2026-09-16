@@ -152,6 +152,30 @@ dnssd_get_hw_addr(dnssd_t *dnssd, int *length)
     return dnssd->hw_addr;
 }
 
+int
+dnssd_reregister(dnssd_t *dnssd, unsigned short raop_port, unsigned short airplay_port)
+{
+    /* Built purely from the public unregister/register API, not backend
+     * internals (dnssd_t's raop_service/TXTRecordDeallocate-style fields
+     * are private to each backend -- lib/dns_sd/dns_sd.c and
+     * lib/mdnsd/dnssd_mdnsd.c -- and unreachable from this file). Safe to
+     * compose this way on both backends: neither's unregister_raop/
+     * airplay frees dnssd->name/hw_addr as a side effect (unlike the
+     * pre-refactor monolithic dnssd.c this was originally written
+     * against, where that free -- fine when followed by dnssd_destroy(),
+     * a real use-after-free otherwise -- crashed the process with
+     * SIGABRT every ~5 minutes when called from a periodic refresh
+     * instead), and both backends' register_raop/airplay restart their
+     * underlying daemon/connection unconditionally, so calling them again
+     * after a full unregister is a normal, supported sequence. */
+    assert(dnssd);
+    dnssd_unregister_raop(dnssd);
+    dnssd_unregister_airplay(dnssd);
+    int err = dnssd_register_raop(dnssd, raop_port);
+    if (err) return err;
+    return dnssd_register_airplay(dnssd, airplay_port);
+}
+
 uint64_t dnssd_get_airplay_features(dnssd_t *dnssd) {
     uint64_t features = ((uint64_t) dnssd->features2) << 32;
     features += (uint64_t) dnssd->features1;
