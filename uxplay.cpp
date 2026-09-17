@@ -3631,6 +3631,11 @@ int main (int argc, char *argv[]) {
 }
  
 static void cleanup() {
+    if (mux_to_file) {
+        /* Without this, exit(0) kills the pipeline before EOS reaches
+         * mp4mux, and the moov atom never gets written. */
+        mux_renderer_stop();
+    }
     if (use_audio) {
         audio_renderer_destroy();
     }
