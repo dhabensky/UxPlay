@@ -364,7 +364,16 @@ void audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned s
         break;
     }
     if (valid) {
-        gst_app_src_push_buffer(GST_APP_SRC(renderer->appsrc), buffer);
+        GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(renderer->appsrc), buffer);
+        if (ret != GST_FLOW_OK) {
+            /* appsrc stopped accepting data; self-heal by cycling the
+             * renderer instead of going silent forever. */
+            logger_log(logger, LOGGER_ERR, "*** ERROR gst_app_src_push_buffer failed, GstFlowReturn = %d (%s); restarting audio renderer",
+                       ret, gst_flow_get_name(ret));
+            unsigned char ct = renderer->ct;
+            audio_renderer_stop();
+            audio_renderer_start(&ct);
+        }
     } else {
         logger_log(logger, LOGGER_ERR, "*** ERROR invalid  audio frame (compression_type %d) skipped ", renderer->ct);
         logger_log(logger, LOGGER_ERR, "***       first byte of invalid frame was  0x%2.2x ", (unsigned int) data[0]);
