@@ -187,9 +187,9 @@ void mux_renderer_choose_audio_codec(unsigned char audio_ct) {
         logger_log(logger, LOGGER_DEBUG, "Audio codec changed, recreating mux renderer");
         mux_renderer_destroy();
     }
-    if (audio_ct == 2) {
-        mux_renderer_start();
-    }
+    /* Unconditional, matching the video path below -- start() is
+     * idempotent, so this is safe even when video also starts it. */
+    mux_renderer_start();
 }
 
 /* called by video_set_codec calback in uxplay.cpp, from raop_rtp_mirror */
