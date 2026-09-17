@@ -31,6 +31,7 @@
 #include "compat.h"
 #include "raop_rtp_mirror.h"
 #include "raop_ntp.h"
+#include "raop_conn_policy.h"
 
 
 /* libplist-2.3.0  API change */
@@ -295,8 +296,16 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
             conn->client_session_id = (char *) calloc(strlen(client_session_id) + 1, sizeof(char));
             assert(conn->client_session_id);
             memcpy(conn->client_session_id, client_session_id, strlen(client_session_id));
-            /* airplay video has been requested: shut down any running RAOP udp services */
+            /* Shut down any running RAOP udp services, unless this looks
+             * like the same client's own auxiliary connection. */
             raop_conn_t *raop_conn = (raop_conn_t *) httpd_get_connection_by_type(raop->httpd, CONNECTION_TYPE_RAOP, 1);
+            if (raop_conn && !raop_should_teardown_existing_connection(raop_conn->remote, raop_conn->remotelen,
+                                                                        conn->remote, conn->remotelen)) {
+                logger_log(raop->logger, LOGGER_INFO, "New AirPlay connection %p: existing RAOP connection %p"
+                           " is from the same remote address -- leaving its audio/mirror/NTP services alone"
+                           " instead of tearing them down", ptr, raop_conn);
+                raop_conn = NULL;
+            }
             if (raop_conn) {
                 raop_rtp_mirror_t *raop_rtp_mirror = raop_conn->raop_rtp_mirror;
                 if (raop_rtp_mirror) {
