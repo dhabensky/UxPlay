@@ -67,7 +67,14 @@ endif()
 
 install( TARGETS  uxplay RUNTIME DESTINATION bin )
 install( FILES uxplay.1 DESTINATION ${CMAKE_INSTALL_MANDIR}/man1 )
-install( FILES README.md README.txt README.html LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR} ) 
+install( FILES README.md README.txt README.html LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR} )
+
+# synthetic-client: a standalone RTSP/RTP test driver for exercising the
+# real uxplay server as a genuinely separate process (see
+# tools/synthetic-client.cpp and docs/threadtest.md). Not installed --
+# dev/test tooling only, built alongside uxplay.
+add_executable( synthetic-client tools/synthetic-client.cpp )
+target_link_libraries( synthetic-client airplay )
 install( FILES lib/llhttp/LICENSE-MIT DESTINATION ${CMAKE_INSTALL_DOCDIR}/llhttp )
 install( FILES uxplay.service DESTINATION ${CMAKE_INSTALL_DOCDIR}/systemd ) 
 install( FILES Bluetooth_LE_beacon/uxplay-beacon.1 DESTINATION ${CMAKE_INSTALL_MANDIR}/man1 )
