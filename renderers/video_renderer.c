@@ -95,6 +95,9 @@ struct video_renderer_s {
 
 static video_renderer_t *renderer = NULL;
 static video_renderer_t *renderer_type[NCODECS] = {0};
+/* Set once the pipeline's state change is confirmed done; guards against
+ * pushing buffers to an appsrc still mid-transition (real crash). */
+static gint video_renderer_ready = 0;
 static int n_renderers = NCODECS;
 static char h264[] = "h264";
 static char h265[] = "h265";
@@ -255,6 +258,7 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
     GError *error = NULL;
     GstCaps *caps = NULL;
     bool rtp = (bool) strlen(rtp_pipeline);
+    g_atomic_int_set(&video_renderer_ready, 0);
     hls_video = (uri != NULL);
     /* videosink choices that are auto */
     auto_videosink = (strstr(videosink, "autovideosink") || strstr(videosink, "fpsdisplaysink"));
@@ -509,19 +513,25 @@ void video_renderer_resume() {
 
 void video_renderer_start() {
     GstState state;
+    GstStateChangeReturn ret;
     const gchar *state_name = NULL;
     if (hls_video) {
         g_object_set (G_OBJECT (renderer->pipeline), "uri", renderer->uri, NULL);
         gst_element_set_state (renderer->pipeline, GST_STATE_PAUSED);
-	gst_element_get_state(renderer->pipeline, &state, NULL, 1000 * GST_MSECOND);
+        do {
+            ret = gst_element_get_state(renderer->pipeline, &state, NULL, 1000 * GST_MSECOND);
+        } while (ret == GST_STATE_CHANGE_ASYNC);
 	state_name = gst_element_state_get_name(state);
 	logger_log(logger, LOGGER_DEBUG, "video renderer_start: state %s", state_name);
+        g_atomic_int_set(&video_renderer_ready, 1);
         return;
-    } 
+    }
     /* when not hls, start both h264 and h265 pipelines; will shut down the "wrong" one when we know the codec */
     for (int i = 0; i < n_renderers; i++) {
         gst_element_set_state (renderer_type[i]->pipeline, GST_STATE_PAUSED);
-        gst_element_get_state(renderer_type[i]->pipeline, &state, NULL, 1000 * GST_MSECOND);
+        do {
+            ret = gst_element_get_state(renderer_type[i]->pipeline, &state, NULL, 1000 * GST_MSECOND);
+        } while (ret == GST_STATE_CHANGE_ASYNC);
         state_name = gst_element_state_get_name(state);
         logger_log(logger, LOGGER_DEBUG, "video renderer_start: renderer %d %p state %s", i, renderer_type[i], state_name);
     }
@@ -530,6 +540,9 @@ void video_renderer_start() {
 #ifdef X_DISPLAY_FIX
     X11_search_attempts = 0;
 #endif
+    /* Only now, with every pipeline confirmed out of ASYNC, is it safe to
+     * push buffers into any renderer's appsrc. */
+    g_atomic_int_set(&video_renderer_ready, 1);
 }
 
 /* used to find any X11 Window used by the playbin (HLS) pipeline after it starts playing. 
@@ -609,6 +622,12 @@ void video_renderer_display_jpeg(const void *data, int *data_len) {
 
 uint64_t video_renderer_render_buffer(unsigned char* data, int *data_len, int *nal_count, uint64_t *ntp_time) {
     GstBuffer *buffer = NULL;
+    if (!g_atomic_int_get(&video_renderer_ready)) {
+        /* Pipeline (e.g. kmssink's DRM setup) hasn't finished its state
+         * transition yet: drop this frame rather than race on
+         * renderer->appsrc, see video_renderer_ready's own comment. */
+        return 0;
+    }
     GstClockTime pts = (GstClockTime) *ntp_time; /*now in nsecs */
     //GstClockTimeDiff latency = GST_CLOCK_DIFF(gst_element_get_current_clock_time (renderer->appsrc), pts);
     if (sync) {
@@ -761,6 +780,7 @@ static void video_renderer_destroy_instance(video_renderer_t *renderer) {
 }
 
 void video_renderer_destroy() {
+    g_atomic_int_set(&video_renderer_ready, 0);
     for (int i = 0; i < n_renderers; i++) {
         if (renderer_type[i]) {
             video_renderer_destroy_instance(renderer_type[i]);
