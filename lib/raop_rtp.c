@@ -251,8 +251,8 @@ raop_rtp_init_sockets(raop_rtp_t *raop_rtp, int use_ipv6)
     /* Set port values */
     raop_rtp->control_lport = cport;
     raop_rtp->data_lport = dport;
-    logger_log(raop_rtp->logger, LOGGER_DEBUG, "raop_rtp local control port socket %d port UDP %d", csock, cport);
-    logger_log(raop_rtp->logger, LOGGER_DEBUG, "raop_rtp local data port    socket %d port UDP %d", dsock, dport);
+    logger_log(raop_rtp->logger, LOGGER_INFO, "raop_rtp local control port socket %d port UDP %d", csock, cport);
+    logger_log(raop_rtp->logger, LOGGER_INFO, "raop_rtp local data port    socket %d port UDP %d", dsock, dport);
     return 0;
 
     sockets_cleanup:
@@ -662,6 +662,10 @@ raop_rtp_start_audio(raop_rtp_t *raop_rtp,  unsigned short *control_rport, unsig
 
     MUTEX_LOCK(raop_rtp->run_mutex);
     if (raop_rtp->running || !raop_rtp->joined) {
+        /* Redundant SETUP for an already-active stream: report the ports
+         * it's already bound to, not the caller's zero-initialized default. */
+        *control_lport = raop_rtp->control_lport;
+        *data_lport = raop_rtp->data_lport;
         MUTEX_UNLOCK(raop_rtp->run_mutex);
         return;
     }
