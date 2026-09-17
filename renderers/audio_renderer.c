@@ -396,6 +396,12 @@ void audio_renderer_set_volume(double volume) {
 }
 
 void audio_renderer_flush() {
+    /* AirPlay FLUSH = seek/pause: clear the whole pipeline so stale
+     * pre-seek audio doesn't keep playing and drag A/V out of sync. */
+    if (renderer && renderer->pipeline) {
+        gst_element_send_event(renderer->pipeline, gst_event_new_flush_start());
+        gst_element_send_event(renderer->pipeline, gst_event_new_flush_stop(TRUE));
+    }
 }
 
 void audio_renderer_destroy() {
