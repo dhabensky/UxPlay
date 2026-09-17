@@ -18,6 +18,12 @@ void logger_log(logger_t *logger, int level, const char *fmt, ...) {
     va_end(ap);
 }
 
+/* Stub: audio_renderer.c now references this extern (video_renderer.c's
+ * A/V sync probe installer), which this test has no reason to link. */
+void install_av_sync_probe(GstElement *pipeline) {
+    (void) pipeline;
+}
+
 /* audio_renderer.c's `renderer` and gstreamer_audio_pipeline_bus_callback
  * are file-static; pull the translation unit in directly so we can call it. */
 #include "../renderers/audio_renderer.c"

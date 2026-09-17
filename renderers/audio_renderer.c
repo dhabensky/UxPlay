@@ -26,6 +26,9 @@
 #include "audio_renderer.h"
 #define SECOND_IN_NSECS 1000000000UL
 
+/* A/V sync self-measurement probe installer, defined in video_renderer.c */
+void install_av_sync_probe(GstElement *pipeline);
+
 #define NFORMATS 2     /* set to 4 to enable AAC_LD and PCM:  allowed, but  never seen in real-world use */
 
 static GstClockTime gst_audio_pipeline_base_time = GST_CLOCK_TIME_NONE;
@@ -206,6 +209,7 @@ void audio_renderer_init(logger_t *render_logger, const char* audiosink, const b
 
         g_assert (renderer_type[i]->pipeline);
         gst_pipeline_use_clock(GST_PIPELINE_CAST(renderer_type[i]->pipeline), clock);
+        install_av_sync_probe(renderer_type[i]->pipeline);
         renderer_type[i]->bus = gst_element_get_bus(renderer_type[i]->pipeline);
         renderer_type[i]->appsrc = gst_bin_get_by_name (GST_BIN (renderer_type[i]->pipeline), "audio_source");
         renderer_type[i]->volume = gst_bin_get_by_name (GST_BIN (renderer_type[i]->pipeline), "volume");

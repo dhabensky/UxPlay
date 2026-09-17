@@ -252,6 +252,88 @@ g_string_replace (GString     *string,
 }
 #endif
 
+/* Opt-in A/V sync self-measurement: detects a flash+beep test marker by
+ * buffer content and logs when each reaches its sink, so real output
+ * offset can be measured without watching the TV. */
+static GstPadProbeReturn av_sync_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) {
+    (void) pad;
+    GstBuffer *buf = GST_PAD_PROBE_INFO_BUFFER(info);
+    GstElement *sink = (GstElement *) user_data;
+    if (!buf) return GST_PAD_PROBE_OK;
+    GstClock *clock = gst_element_get_clock(sink);
+    if (!clock) return GST_PAD_PROBE_OK;
+    GstClockTime now = gst_clock_get_time(clock);
+    gst_object_unref(clock);
+    GstClockTime base = gst_element_get_base_time(sink);
+    if (!GST_CLOCK_TIME_IS_VALID(base) || now < base) return GST_PAD_PROBE_OK;
+    double t_ms = (double)(now - base) / 1000000.0;
+
+    const gchar *name = GST_ELEMENT_NAME(sink);
+    gboolean is_audio = (name && strstr(name, "alsa"));
+    GstMapInfo map;
+    if (!gst_buffer_map(buf, &map, GST_MAP_READ)) return GST_PAD_PROBE_OK;
+    gboolean marker = FALSE;
+    if (is_audio) {
+        /* S16LE samples: peak amplitude. Loud accent >> quiet baseline. */
+        gint16 *s = (gint16 *) map.data;
+        gsize n = map.size / 2;
+        int loud = 0, cnt = 0;
+        for (gsize i = 0; i < n; i += 3) { int a = s[i]; if (a < 0) a = -a; if (a > 26000) loud++; cnt++; }
+        int pct = cnt > 0 ? (loud * 100 / cnt) : 0;   /* accent burst saturates far more samples than baseline */
+        marker = (pct > 55);
+        if (g_getenv("UX_PROBE_DBG")) { static int ac = 0; if ((ac++ % 50) == 0) g_print("APROBE loud_pct=%d\n", pct); }
+    } else {
+        /* Count bright pixels in the Y plane (first ~2/3 of an I420/NV12 buffer).
+         * The flash may cover only the player window (mirrored desktop, not full
+         * screen), so use the FRACTION of near-white Y samples, not the average. */
+        gsize ylen = (map.size / 3) * 2;
+        gsize step = ylen > 8192 ? ylen / 4096 : 1;
+        if (step == 0) step = 1;
+        int bright = 0, cnt = 0;
+        for (gsize i = 0; i < ylen; i += step) { if (map.data[i] > 200) bright++; cnt++; }
+        int pct = cnt > 0 ? (bright * 100 / cnt) : 0;
+        marker = (pct > 15);
+        if (g_getenv("UX_PROBE_DBG")) {
+            static int vc = 0;
+            if ((vc++ % 30) == 0) g_print("VPROBE size=%zu bright_pct=%d\n", map.size, pct);
+        }
+    }
+    gst_buffer_unmap(buf, &map);
+
+    GstClockTime *last = (GstClockTime *) g_object_get_data(G_OBJECT(sink), "avlast");
+    if (!last) { last = g_new0(GstClockTime, 1); g_object_set_data_full(G_OBJECT(sink), "avlast", last, g_free); }
+    if (marker && (now < *last || now - *last > 800 * GST_MSECOND)) {
+        *last = now;
+        g_print("AVMARK %s t=%.1f ms\n", is_audio ? "audio" : "video", t_ms);
+    }
+    return GST_PAD_PROBE_OK;
+}
+
+void install_av_sync_probe(GstElement *pipeline) {
+    if (!g_getenv("UX_PROBE")) return;   /* opt-in: maps every buffer, only for A/V-sync measurement */
+    GstIterator *it = gst_bin_iterate_sinks(GST_BIN(pipeline));
+    GValue v = G_VALUE_INIT;
+    gboolean done = FALSE;
+    while (!done) {
+        switch (gst_iterator_next(it, &v)) {
+        case GST_ITERATOR_OK: {
+            GstElement *sink = GST_ELEMENT(g_value_get_object(&v));
+            GstPad *p = gst_element_get_static_pad(sink, "sink");
+            if (p) {
+                gst_pad_add_probe(p, GST_PAD_PROBE_TYPE_BUFFER, av_sync_probe, sink, NULL);
+                gst_object_unref(p);
+            }
+            g_value_reset(&v);
+            break;
+        }
+        case GST_ITERATOR_RESYNC: gst_iterator_resync(it); break;
+        default: done = TRUE; break;
+        }
+    }
+    g_value_unset(&v);
+    gst_iterator_free(it);
+}
+
 void video_renderer_init(logger_t *render_logger, const char *server_name, videoflip_t videoflip[2], const char *parser, const char * rtp_pipeline,
                           const char *decoder, const char *converter, const char *videosink, const char *videosink_options, 
                           bool initial_fullscreen, bool video_sync, bool h265_support, bool coverart_support, guint playbin_version, const char *uri) {
@@ -437,6 +519,7 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
             g_string_free(launch, TRUE);
             gst_caps_unref(caps);
             gst_object_unref(clock);
+            install_av_sync_probe(renderer_type[i]->pipeline);
             if (jpeg_pipeline) {
                  renderer_type[i]->textsrc = gst_bin_get_by_name(GST_BIN(renderer_type[i]->pipeline), "metadata_overlay");
                  g_object_set(G_OBJECT(renderer_type[i]->textsrc), "text", "", "shaded-background", TRUE, "font-desc", "Sans, 16",  NULL);
