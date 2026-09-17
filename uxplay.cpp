@@ -187,6 +187,7 @@ static guint gst_hls_position_id = 0;
 static bool preserve_connections = false;
 static guint missed_feedback_limit = MISSED_FEEDBACK_LIMIT;
 static guint missed_feedback = 0;
+static guint audio_queue_ms = 0;  /* 0 = unbounded, matching the video queue's default */
 static guint playbin_version = DEFAULT_PLAYBIN_VERSION;
 static bool reset_httpd = false;
 static bool monitor_progress = false;
@@ -1016,6 +1017,7 @@ static void print_info (char *name) {
     printf("-ca [<fn>]In Audio (ALAC) mode, render cover-art [or write to file <fn>]\n");
     printf("-md <fn>  In Airplay Audio (ALAC) mode, write metadata text to file <fn>\n");
     printf("-reset n  Reset after n seconds of client silence (default n=%d, 0=never)\n", MISSED_FEEDBACK_LIMIT);
+    printf("-aqueuems n  Cap the audio queue at n milliseconds (default 0=unbounded)\n");
     printf("-nofreeze Do NOT leave frozen screen in place after reset\n");
     printf("-nc       Do NOT  Close video window when client stops mirroring\n");
     printf("-nc no    Cancel the -nc option (DO close video window) \n");
@@ -1483,10 +1485,15 @@ static void parse_arguments (int argc, char *argv[]) {
             show_client_FPS_data = true;
         } else if (arg == "-reset") {
             /* now using feedback  (every 1 sec ) instead of ntp timeouts (every 3 secs) to detect offline client and reset connections */
-            fprintf(stderr,"*** NOTE CHANGE: -reset n now means reset n seconds (not 3n seconds) after client goes offline\n");	  
+            fprintf(stderr,"*** NOTE CHANGE: -reset n now means reset n seconds (not 3n seconds) after client goes offline\n");
             missed_feedback_limit = 0;
             if (!get_value(argv[++i], &missed_feedback_limit)) {
                 fprintf(stderr, "invalid \"-reset %s\"; -reset n must have n >= 0,  default n = %d seconds\n", argv[i], MISSED_FEEDBACK_LIMIT);
+                exit(1);
+            }
+        } else if (arg == "-aqueuems") {
+            if (!get_value(argv[++i], &audio_queue_ms)) {
+                fprintf(stderr, "invalid \"-aqueuems %s\"; must have n >= 0, default n = 0 (unbounded)\n", argv[i]);
                 exit(1);
             }
 	} else if (arg == "-vrtp") {
@@ -3182,7 +3189,7 @@ int main (int argc, char *argv[]) {
     logger_set_level(render_logger, log_level);
 
     if (use_audio) {
-        audio_renderer_init(render_logger, audiosink.c_str(), &audio_sync, &video_sync, audio_rtp_pipeline.c_str());
+        audio_renderer_init(render_logger, audiosink.c_str(), &audio_sync, &video_sync, audio_rtp_pipeline.c_str(), audio_queue_ms);
     } else {
         LOGI("audio_disabled");
     }

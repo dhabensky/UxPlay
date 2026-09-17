@@ -365,7 +365,10 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
             if (jpeg_pipeline) {
                 g_string_append(launch, "jpegdec ");
             } else {
-                g_string_append(launch, "queue ! ");
+                /* Unbounded: GStreamer's default limits can drop a late
+                 * frame upstream of the decoder instead of just rendering
+                 * it late. */
+                g_string_append(launch, "queue max-size-buffers=0 max-size-bytes=0 max-size-time=0 ! ");
                 g_string_append(launch, parser);
                 g_string_append(launch, " ! ");
                 if (!rtp) {

@@ -125,7 +125,7 @@ bool gstreamer_init(){
     return (bool) check_plugins ();
 }
 
-void audio_renderer_init(logger_t *render_logger, const char* audiosink, const bool* audio_sync, const bool* video_sync, const char *artp_pipeline) {
+void audio_renderer_init(logger_t *render_logger, const char* audiosink, const bool* audio_sync, const bool* video_sync, const char *artp_pipeline, unsigned int audio_queue_ms) {
     GError *error = NULL;
     GstCaps *caps = NULL;
     GstClock *clock = gst_system_clock_obtain();
@@ -137,7 +137,7 @@ void audio_renderer_init(logger_t *render_logger, const char* audiosink, const b
     }
 
     logger = render_logger;
-    
+
     aac = check_plugin_feature (avdec_aac);
     alac = check_plugin_feature (avdec_alac);
 
@@ -145,7 +145,11 @@ void audio_renderer_init(logger_t *render_logger, const char* audiosink, const b
         renderer_type[i] = (audio_renderer_t *)  calloc(1,sizeof(audio_renderer_t));
         g_assert(renderer_type[i]);
         GString *launch = g_string_new("appsrc name=audio_source ! ");
-        g_string_append(launch, "queue ! ");
+        /* -aqueuems caps queue drain time; 0 (default) is unbounded, same
+         * as the video queue -- avoids baking a site-specific tuning
+         * value into this general codebase. */
+        g_string_append_printf(launch, "queue max-size-buffers=0 max-size-bytes=0 max-size-time=%u ! ",
+                                audio_queue_ms * 1000000U);
         switch (i) {
         case 0:    /* AAC-ELD */
         case 2:    /* AAC-LC */
