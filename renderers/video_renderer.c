@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
+#include <gst/video/gstvideodecoder.h>
 #include "video_renderer.h"
 
 #define SECOND_IN_NSECS 1000000000UL
@@ -90,6 +91,10 @@ struct video_renderer_s {
     gboolean eos;
     gint64 duration;
     gint buffering_level;
+    /* Render-health counters (install_render_health_probes()); written
+     * from a streaming thread, read from the GMainLoop, hence g_atomic. */
+    gint decode_count;
+    gint render_count;
 #ifdef  X_DISPLAY_FIX
     bool use_x11;
     const char * server_name;
@@ -338,6 +343,74 @@ void install_av_sync_probe(GstElement *pipeline) {
     gst_iterator_free(it);
 }
 
+/* Render-health watchdog: always-on (unlike av_sync_probe above), plain
+ * counters consumed by uxplay.cpp's render_health_callback. */
+static GstPadProbeReturn count_buffer_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) {
+    (void) pad;
+    if (!GST_PAD_PROBE_INFO_BUFFER(info)) return GST_PAD_PROBE_OK;
+    g_atomic_int_inc((gint *) user_data);
+    return GST_PAD_PROBE_OK;
+}
+
+static void install_render_health_probes(GstElement *pipeline, video_renderer_t *r) {
+    /* Decode-side: found by class check, robust to whichever -vd decoder
+     * is in use. */
+    GstIterator *it = gst_bin_iterate_elements(GST_BIN(pipeline));
+    GValue v = G_VALUE_INIT;
+    gboolean done = FALSE;
+    while (!done) {
+        switch (gst_iterator_next(it, &v)) {
+        case GST_ITERATOR_OK: {
+            GstElement *el = GST_ELEMENT(g_value_get_object(&v));
+            if (GST_IS_VIDEO_DECODER(el)) {
+                GstPad *p = gst_element_get_static_pad(el, "src");
+                if (p) {
+                    gst_pad_add_probe(p, GST_PAD_PROBE_TYPE_BUFFER, count_buffer_probe, &r->decode_count, NULL);
+                    gst_object_unref(p);
+                }
+            }
+            g_value_reset(&v);
+            break;
+        }
+        case GST_ITERATOR_RESYNC: gst_iterator_resync(it); break;
+        default: done = TRUE; break;
+        }
+    }
+    g_value_unset(&v);
+    gst_iterator_free(it);
+
+    /* Render-side. Only "decode advancing, render not" is this
+     * watchdog's collapse signature -- both idle is normal, not a bug. */
+    it = gst_bin_iterate_sinks(GST_BIN(pipeline));
+    done = FALSE;
+    while (!done) {
+        switch (gst_iterator_next(it, &v)) {
+        case GST_ITERATOR_OK: {
+            GstElement *sink = GST_ELEMENT(g_value_get_object(&v));
+            GstPad *p = gst_element_get_static_pad(sink, "sink");
+            if (p) {
+                gst_pad_add_probe(p, GST_PAD_PROBE_TYPE_BUFFER, count_buffer_probe, &r->render_count, NULL);
+                gst_object_unref(p);
+            }
+            g_value_reset(&v);
+            break;
+        }
+        case GST_ITERATOR_RESYNC: gst_iterator_resync(it); break;
+        default: done = TRUE; break;
+        }
+    }
+    g_value_unset(&v);
+    gst_iterator_free(it);
+}
+
+gint video_renderer_get_decode_count(void) {
+    return renderer ? g_atomic_int_get(&renderer->decode_count) : 0;
+}
+
+gint video_renderer_get_render_count(void) {
+    return renderer ? g_atomic_int_get(&renderer->render_count) : 0;
+}
+
 void video_renderer_init(logger_t *render_logger, const char *server_name, videoflip_t videoflip[2], const char *parser, const char * rtp_pipeline,
                           const char *decoder, const char *converter, const char *videosink, const char *videosink_options, 
                           bool initial_fullscreen, bool video_sync, bool h265_support, bool coverart_support, guint playbin_version, const char *uri) {
@@ -526,6 +599,7 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
             gst_caps_unref(caps);
             gst_object_unref(clock);
             install_av_sync_probe(renderer_type[i]->pipeline);
+            install_render_health_probes(renderer_type[i]->pipeline, renderer_type[i]);
             if (jpeg_pipeline) {
                  renderer_type[i]->textsrc = gst_bin_get_by_name(GST_BIN(renderer_type[i]->pipeline), "metadata_overlay");
                  g_object_set(G_OBJECT(renderer_type[i]->textsrc), "text", "", "shaded-background", TRUE, "font-desc", "Sans, 16",  NULL);

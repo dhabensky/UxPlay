@@ -76,6 +76,11 @@ int video_renderer_choose_codec (bool video_is_jpeg, bool video_is_h265);
 unsigned int video_renderer_listen(void *loop, int id);
 bool video_renderer_eos_watch();
 void video_renderer_hls_set_volume(double volume);
+/* Render-health watchdog counters (see uxplay.cpp's render_health_callback):
+ * plain counts of buffers reaching the active pipeline's decoder-src and
+ * sink-sink pads. Return 0 if there's no active renderer yet. */
+int video_renderer_get_decode_count(void);
+int video_renderer_get_render_count(void);
 #ifdef __cplusplus
 }
 #endif
