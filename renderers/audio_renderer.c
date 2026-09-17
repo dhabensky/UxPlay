@@ -355,6 +355,11 @@ void  audio_renderer_start(unsigned char *ct) {
             gst_element_set_state (renderer->pipeline, GST_STATE_PLAYING);
             gst_audio_pipeline_base_time = gst_element_get_base_time(renderer->appsrc);
             tt_calls_since_start = 0;
+        } else {
+            /* Same codec, repeated SETUP: still refresh base_time, or it
+             * drifts from raop_rtp.c's just-reset sync state. */
+            gst_audio_pipeline_base_time = gst_element_get_base_time(renderer->appsrc);
+            tt_calls_since_start = 0;
         }
     } else if (id >= 0) {
         logger_log(logger, LOGGER_INFO, "start audio connection, format %s", format[id]);

@@ -673,6 +673,13 @@ raop_rtp_start_audio(raop_rtp_t *raop_rtp,  unsigned short *control_rport, unsig
     raop_rtp->ct = *ct;
     raop_rtp->rtp_clock_rate = SECOND_IN_NSECS / *sr;
 
+    /* Reset on every SETUP: a new session starts a new RTP timestamp
+     * range, and reusing the old sync against it computed nonsense NTP
+     * times until the next RTCP sync packet corrected it. */
+    raop_rtp->rtp_sync = 0;
+    raop_rtp->client_ntp_sync = 0;
+    raop_rtp->initial_sync = false;
+
     /* Initialize ports and sockets */
     raop_rtp->control_lport = *control_lport;
     raop_rtp->data_lport = *data_lport;
