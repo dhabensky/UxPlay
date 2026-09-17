@@ -42,6 +42,12 @@
  * suppresses repeat requests for the *same* gap, not the first one. */
 #define RAOP_RESEND_MIN_INTERVAL_NS 100000000ULL /* 100ms */
 
+/* raop_buffer_dequeue() normally waits for the full RAOP_BUFFER_LENGTH
+ * capacity before skipping a missing packet -- at AAC-ELD's cadence that
+ * takes ~2.8s. This timeout force-skips a stuck slot sooner, regardless
+ * of capacity, once ordinary resend round-trips have had a fair chance. */
+#define RAOP_STALL_TIMEOUT_NS 200000000ULL /* 200ms */
+
 typedef struct {
     /* Data available */
     int filled;
@@ -72,6 +78,11 @@ struct raop_buffer_s {
     bool last_resend_requested;
     unsigned short last_resend_first_seqnum;
     uint64_t last_resend_request_ns;
+
+    /* Stall timeout (RAOP_STALL_TIMEOUT_NS). Reset only on a real
+     * dequeue, not per force-skip, so a multi-packet gap clears at once. */
+    bool stalled;
+    uint64_t stall_since_ns;
 
     /* RTP buffer entries */
     raop_buffer_entry_t entries[RAOP_BUFFER_LENGTH];
@@ -255,12 +266,24 @@ raop_buffer_dequeue(raop_buffer_t *raop_buffer, unsigned int *length, uint32_t *
     if (no_resend) {
         /* If we do no resends, always return the first entry */
     } else if (!entry->filled) {
+        /* See RAOP_STALL_TIMEOUT_NS above: bound how long this specific
+         * slot can block progress, independent of how much room is left
+         * in the buffer. */
+        struct timespec now_ts;
+        clock_gettime(CLOCK_MONOTONIC, &now_ts);
+        uint64_t now_ns = (uint64_t) now_ts.tv_sec * 1000000000ULL + (uint64_t) now_ts.tv_nsec;
+        if (!raop_buffer->stalled) {
+            raop_buffer->stalled = true;
+            raop_buffer->stall_since_ns = now_ns;
+        }
+        bool stalled_too_long = (now_ns - raop_buffer->stall_since_ns) >= RAOP_STALL_TIMEOUT_NS;
         /* Check how much we have space left in the buffer */
-        if (entry_count < RAOP_BUFFER_LENGTH) {
+        if (entry_count < RAOP_BUFFER_LENGTH && !stalled_too_long) {
             /* Return nothing and hope resend gets on time */
             return NULL;
         }
-        /* Risk of buffer overrun, return empty buffer */
+        /* Buffer overrun or stuck too long -- force past this entry.
+         * Deliberately don't reset `stalled` here (see its own comment). */
     }
 
     /* Update buffer and validate entry */
@@ -269,6 +292,7 @@ raop_buffer_dequeue(raop_buffer_t *raop_buffer, unsigned int *length, uint32_t *
         return NULL;
     }
     entry->filled = 0;
+    raop_buffer->stalled = false;
 
     /* Return entry payload buffer */
     *rtp_timestamp = entry->rtp_timestamp;
