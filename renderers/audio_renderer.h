@@ -36,6 +36,10 @@ bool gstreamer_init();
 void audio_renderer_init(logger_t *logger, const char* audiosink, const bool *audio_sync, const bool *video_sync, const char *artp_pipeline, unsigned int audio_queue_ms);
 void audio_renderer_start(unsigned char* compression_type);
 void audio_renderer_stop();
+/* Deferred variant (runs on the main GMainLoop, not inline) for the two
+ * call sites racing the httpd and RAOP audio threads -- see audio_renderer.c.
+ * force_restart also stops before starting, for self-healing a stuck appsrc. */
+void audio_renderer_start_deferred(unsigned char compression_type, bool force_restart);
 void audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned short *seqnum, uint64_t *ntp_time);
 void audio_renderer_set_volume(double volume);
 void audio_renderer_flush();

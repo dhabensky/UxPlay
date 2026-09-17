@@ -2795,7 +2795,9 @@ extern "C" void audio_get_format (void *cls, unsigned char *ct, unsigned short *
 
     if (do_capture) cap_write('C', NULL, 0, (uint64_t) *ct);
     if (use_audio) {
-      audio_renderer_start(ct);
+      /* Deferred: this httpd-thread handler would otherwise race the RAOP
+       * audio thread's own self-heal path (see audio_renderer.c). */
+      audio_renderer_start_deferred(*ct, false);
     }
 
     if (mux_to_file) {

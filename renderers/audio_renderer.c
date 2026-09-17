@@ -312,6 +312,28 @@ void  audio_renderer_start(unsigned char *ct) {
     }
 }
 
+/* The httpd thread and the RAOP audio thread can both call
+ * audio_renderer_start()/_stop() unlocked; defer these two call sites
+ * onto the main GMainLoop to serialize them. Every other caller (e.g.
+ * audio_renderer_destroy()) keeps the synchronous behavior it needs.
+ * force_restart is packed into the high byte of the gpointer: a self-heal
+ * needs an unconditional stop()+start() (audio_renderer_start()'s own
+ * "same ct" branch alone doesn't rebuild a broken appsrc). */
+static gboolean audio_renderer_deferred_start_cb(gpointer data) {
+    guint packed = GPOINTER_TO_UINT(data);
+    unsigned char ct = (unsigned char) (packed & 0xff);
+    if (packed & 0x100) {
+        audio_renderer_stop();
+    }
+    audio_renderer_start(&ct);
+    return G_SOURCE_REMOVE;
+}
+
+void audio_renderer_start_deferred(unsigned char compression_type, bool force_restart) {
+    guint packed = (guint) compression_type | (force_restart ? 0x100 : 0);
+    g_idle_add(audio_renderer_deferred_start_cb, GUINT_TO_POINTER(packed));
+}
+
 void audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned short *seqnum, uint64_t *ntp_time) {
     GstBuffer *buffer = NULL;
 
@@ -377,12 +399,11 @@ void audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned s
         GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(renderer->appsrc), buffer);
         if (ret != GST_FLOW_OK) {
             /* appsrc stopped accepting data; self-heal by cycling the
-             * renderer instead of going silent forever. */
+             * renderer instead of going silent forever. Deferred to
+             * avoid racing the httpd thread's own audio_renderer_start(). */
             logger_log(logger, LOGGER_ERR, "*** ERROR gst_app_src_push_buffer failed, GstFlowReturn = %d (%s); restarting audio renderer",
                        ret, gst_flow_get_name(ret));
-            unsigned char ct = renderer->ct;
-            audio_renderer_stop();
-            audio_renderer_start(&ct);
+            audio_renderer_start_deferred(renderer->ct, true);
         }
     } else {
         logger_log(logger, LOGGER_ERR, "*** ERROR invalid  audio frame (compression_type %d) skipped ", renderer->ct);
