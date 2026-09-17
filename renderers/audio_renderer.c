@@ -416,11 +416,15 @@ static gboolean gstreamer_audio_pipeline_bus_callback(GstBus *bus, GstMessage *m
         logger_log(logger, LOGGER_INFO, "GStreamer error (audio): %s %s", GST_MESSAGE_SRC_NAME(message),err->message);
         g_error_free(err);
         g_free(debug);
-        if (renderer->appsrc) {
+        /* renderer can be NULL here (before codec selection, or during
+         * teardown) -- guard instead of crashing. */
+        if (renderer && renderer->appsrc) {
             gst_app_src_end_of_stream (GST_APP_SRC(renderer->appsrc));
         }
         gst_bus_set_flushing(bus, TRUE);
-        gst_element_set_state (renderer->pipeline, GST_STATE_READY);
+        if (renderer) {
+            gst_element_set_state (renderer->pipeline, GST_STATE_READY);
+        }
         g_main_loop_quit( (GMainLoop *) loop);
 	break;
     }

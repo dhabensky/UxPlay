@@ -926,10 +926,12 @@ static gboolean gstreamer_video_pipeline_bus_callback(GstBus *bus, GstMessage *m
         }
         g_error_free (err);
         g_free (debug);
-        if (renderer->appsrc) {
+        /* renderer can be NULL here (before codec selection, or during
+         * teardown) -- guard instead of crashing. */
+        if (renderer && renderer->appsrc) {
             gst_app_src_end_of_stream (GST_APP_SRC(renderer->appsrc));
         }
-        if (!hls_video || closed_window) {
+        if (renderer && (!hls_video || closed_window)) {
             gst_bus_set_flushing(bus, TRUE);
             gst_element_set_state (renderer->pipeline, GST_STATE_READY);
             g_main_loop_quit( (GMainLoop *) loop);
@@ -939,7 +941,7 @@ static gboolean gstreamer_video_pipeline_bus_callback(GstBus *bus, GstMessage *m
     case GST_MESSAGE_EOS:
         /* end-of-stream */
         logger_log(logger, LOGGER_INFO, "GStreamer: End-Of-Stream (video)");
-        if (hls_video) {
+        if (hls_video && renderer) {
             gst_bus_set_flushing(bus, TRUE);
             gst_element_set_state (renderer->pipeline, GST_STATE_READY);
             renderer->eos = TRUE;
@@ -979,7 +981,7 @@ static gboolean gstreamer_video_pipeline_bus_callback(GstBus *bus, GstMessage *m
             }
 
         }
-        if (renderer->autovideo) {
+        if (renderer && renderer->autovideo) {
             char *sink = strstr(GST_MESSAGE_SRC_NAME(message), "-actual-sink-");
             if (sink) {
                 sink += strlen("-actual-sink-");
