@@ -1082,29 +1082,35 @@ int video_renderer_choose_codec (bool video_is_jpeg, bool video_is_h265) {
             renderer_used = renderer_type[type_264];
         }
     }
-    if (renderer_used == NULL) {
-        return -1;
-    } else if (renderer_used == renderer) {
-        return 0;
-    } else if (renderer) {
+    /* Can race pipeline (re)creation on the main thread; fail softly
+     * instead of dereferencing NULL. */
+    if (renderer_used == NULL || renderer_used->pipeline == NULL) {
         return -1;
     }
-    renderer = renderer_used;
-    gst_element_set_state (renderer->pipeline, GST_STATE_PLAYING);
+    /* Idempotent if already PLAYING; restarts it if a reconnect left it
+     * in GST_STATE_NULL. Publish the global `renderer` only once
+     * confirmed, so a concurrent reader never sees a half-updated one. */
+    gst_element_set_state (renderer_used->pipeline, GST_STATE_PLAYING);
     GstState old_state, new_state;
-    if (gst_element_get_state(renderer->pipeline, &old_state, &new_state, 100 * GST_MSECOND) == GST_STATE_CHANGE_FAILURE) {
-        g_error("video pipeline failed to go into playing state");
+    if (gst_element_get_state(renderer_used->pipeline, &old_state, &new_state, 100 * GST_MSECOND) == GST_STATE_CHANGE_FAILURE) {
+        logger_log(logger, LOGGER_ERR, "video pipeline failed to go into playing state");
         return -1;
+    }
+    /* Refresh base_time (it changes if the pipeline was restarted from
+     * NULL after a reconnect) so the ntp->pts mapping stays correct. */
+    gst_video_pipeline_base_time = gst_element_get_base_time(renderer_used->appsrc);
+    if (renderer_used == renderer) {
+        return 0; /* was already the active renderer (now re-confirmed PLAYING) */
     }
     logger_log(logger, LOGGER_DEBUG, "video_pipeline state change from %s to %s\n",
                gst_element_state_get_name (old_state),gst_element_state_get_name (new_state));
-    gst_video_pipeline_base_time = gst_element_get_base_time(renderer->appsrc);
-    if (strstr(renderer->codec, h265)) {
+    if (strstr(renderer_used->codec, h265)) {
         logger_log(logger, LOGGER_INFO, "*** video format is h265 high definition (HD/4K) video %dx%d", width, height);
     }
-    /* destroy unused renderers */
+    renderer = renderer_used; /* publish the active renderer last */
+    /* destroy the other (unused) renderers */
     for (int i = 0; i < n_renderers; i++) {
-        if (renderer_type[i] == renderer) {
+        if (renderer_type[i] == renderer_used) {
             continue;
         }
 	if (renderer_type[i]) {
