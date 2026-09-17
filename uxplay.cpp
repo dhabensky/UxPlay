@@ -143,6 +143,167 @@ static int audio_dump_count = 0;
 static bool dump_audio = false;
 static unsigned char audio_type = 0x00;
 static unsigned char previous_audio_type = 0x00;
+
+/* Capture/replay: record decrypted mirror A/V + flush events so a real
+ * session can be replayed e2e without a live sender for every test. */
+#include <time.h>
+static FILE *capture_fp = NULL;
+static pthread_mutex_t capture_mutex = PTHREAD_MUTEX_INITIALIZER;
+static std::string capture_filename;
+static bool do_capture = false;
+static std::string replay_filename;
+static bool do_replay = false;
+static uint64_t cap_mono_ns(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
+}
+/* record layout: [type:1][mono_ns:8][ntp:8][len:4][data:len]
+ * types: 'V' video frame, 'A' audio frame, 'C' ct header (ct in ntp field),
+ *        'v' video flush, 'a' audio flush */
+static void cap_write(char type, const unsigned char *data, int len, uint64_t ntp) {
+    if (!capture_fp) return;
+    uint64_t t = cap_mono_ns();
+    int l = (data && len > 0) ? len : 0;
+    /* audio/video threads both call this; lock so fwrite() calls don't
+     * interleave. Flush periodically, not per-record, to avoid stalling
+     * the hot path on disk I/O. */
+    pthread_mutex_lock(&capture_mutex);
+    fwrite(&type, 1, 1, capture_fp);
+    fwrite(&t, 8, 1, capture_fp);
+    fwrite(&ntp, 8, 1, capture_fp);
+    fwrite(&l, 4, 1, capture_fp);
+    if (l) fwrite(data, 1, l, capture_fp);
+    static int since_flush = 0;
+    if (++since_flush >= 50) { fflush(capture_fp); since_flush = 0; }
+    pthread_mutex_unlock(&capture_mutex);
+}
+
+/* Replay a captured session into the renderers, honouring original
+ * inter-frame timing and flush events. Fully autonomous: a GMainLoop
+ * runs in the main thread while a feeder thread pushes frames. */
+extern "C" void video_process (void *cls, raop_ntp_t *ntp, video_decode_struct *data);
+extern "C" void audio_process (void *cls, raop_ntp_t *ntp, audio_decode_struct *data);
+static GMainLoop *replay_loop = NULL;
+
+/* Simulate a disconnect+reconnect during replay, at UX_RECONNECT_AT_MS. */
+static void replay_do_reconnect(unsigned char ct);
+
+/* A real reconnect gets fresh SPS+PPS prepended by raop_rtp_mirror.c; a
+ * .cap replay doesn't, so scrape them from the first frame and
+ * re-prepend after a simulated reconnect. */
+static unsigned char g_sps_pps[4096];
+static int g_sps_pps_len = 0;
+static bool g_have_sps_pps = false;
+static bool g_prime_next_video_frame = false;
+static void extract_sps_pps(const unsigned char *data, int len) {
+    int i = 0, out = 0;
+    while (i + 4 < len && out < (int) sizeof(g_sps_pps)) {
+        int sc_len = 0;
+        if (data[i] == 0 && data[i+1] == 0 && data[i+2] == 1) sc_len = 3;
+        else if (data[i] == 0 && data[i+1] == 0 && data[i+2] == 0 && data[i+3] == 1) sc_len = 4;
+        else { i++; continue; }
+        int nal_start = i + sc_len;
+        if (nal_start >= len) break;
+        int nal_type = data[nal_start] & 0x1F;
+        if (nal_type != 7 && nal_type != 8) break; /* stop at first non-SPS/PPS NAL */
+        /* find next start code (or end of buffer) to get this NAL's extent */
+        int j = nal_start + 1;
+        while (j + 3 < len && !(data[j] == 0 && data[j+1] == 0 && (data[j+2] == 1 || (data[j+2] == 0 && data[j+3] == 1)))) j++;
+        if (j + 3 >= len) j = len;
+        int nal_total = j - i;
+        if (out + nal_total > (int) sizeof(g_sps_pps)) break;
+        memcpy(g_sps_pps + out, data + i, nal_total);
+        out += nal_total;
+        i = j;
+    }
+    g_sps_pps_len = out;
+    g_have_sps_pps = (out > 0);
+    fprintf(stderr, "replay: extracted %d bytes of SPS/PPS from first video frame for reconnect re-priming\n", out);
+}
+
+static gpointer replay_feeder(gpointer data) {
+    (void) data;
+    FILE *f = fopen(replay_filename.c_str(), "rb");
+    if (!f) { fprintf(stderr, "replay: cannot open %s\n", replay_filename.c_str()); if (replay_loop) g_main_loop_quit(replay_loop); return NULL; }
+    static unsigned char buf[1 << 21];
+    static unsigned char primed_buf[1 << 21];
+    uint64_t first_mono = 0, start_wall = 0;
+    bool have_first = false;
+    bool have_first_video = false;
+    unsigned short seq = 0;
+    unsigned char ct_current = 8;
+    long vframes = 0, aframes = 0, flushes = 0;
+    const char *recon_env = g_getenv("UX_RECONNECT_AT_MS");
+    uint64_t reconnect_at_ns = recon_env ? (uint64_t) atoll(recon_env) * 1000000ULL : 0;
+    bool reconnect_done = false;
+    while (true) {
+        char type; uint64_t t, ntp; int len;
+        if (fread(&type, 1, 1, f) != 1) break;
+        if (fread(&t, 8, 1, f) != 1) break;
+        if (fread(&ntp, 8, 1, f) != 1) break;
+        if (fread(&len, 4, 1, f) != 1) break;
+        if (len > 0) { if (len > (int) sizeof(buf) || fread(buf, 1, len, f) != (size_t) len) break; }
+        if (!have_first) { first_mono = t; start_wall = cap_mono_ns(); have_first = true; }
+        if (reconnect_at_ns && !reconnect_done && (t - first_mono) >= reconnect_at_ns) {
+            replay_do_reconnect(ct_current);
+            reconnect_done = true;
+            g_prime_next_video_frame = true;
+        }
+        uint64_t target = start_wall + (t - first_mono);
+        uint64_t now = cap_mono_ns();
+        if (target > now) {
+            uint64_t d = target - now;
+            struct timespec ts; ts.tv_sec = d / 1000000000ULL; ts.tv_nsec = d % 1000000000ULL;
+            nanosleep(&ts, NULL);
+        }
+        /* Through the real video_process/audio_process callbacks, so the
+         * full live clock path runs (faithful for sync=true testing). */
+        switch (type) {
+        case 'C': { ct_current = (unsigned char) ntp; if (use_audio) audio_renderer_start(&ct_current); break; }
+        case 'A': {
+            audio_decode_struct ad; ad.data = buf; ad.ct = (unsigned char) ct_current; ad.data_len = len;
+            ad.sync_status = 0; ad.ntp_time_local = 0; ad.ntp_time_remote = ntp; ad.rtp_time = 0; ad.seqnum = seq++;
+            audio_process(NULL, NULL, &ad); aframes++; break; }
+        case 'V': {
+            if (!have_first_video) { extract_sps_pps(buf, len); have_first_video = true; }
+            unsigned char *vdata = buf;
+            int vlen = len;
+            if (g_prime_next_video_frame) {
+                g_prime_next_video_frame = false;
+                if (g_have_sps_pps && g_sps_pps_len + len <= (int) sizeof(primed_buf)) {
+                    memcpy(primed_buf, g_sps_pps, g_sps_pps_len);
+                    memcpy(primed_buf + g_sps_pps_len, buf, len);
+                    vdata = primed_buf;
+                    vlen = g_sps_pps_len + len;
+                    fprintf(stderr, "replay: re-primed post-reconnect frame with %d bytes of SPS/PPS\n", g_sps_pps_len);
+                }
+            }
+            video_decode_struct vd; vd.is_h265 = false; vd.nal_count = 0; vd.data = vdata; vd.data_len = vlen;
+            vd.ntp_time_local = 0; vd.ntp_time_remote = ntp;
+            video_process(NULL, NULL, &vd); vframes++; break; }
+        case 'a': { if (use_audio) audio_renderer_flush(); flushes++; break; }
+        case 'v': { if (use_video) video_renderer_flush(); flushes++; break; }
+        default: break;
+        }
+    }
+    fclose(f);
+    fprintf(stderr, "replay: done (%ld video, %ld audio frames, %ld flushes)\n", vframes, aframes, flushes);
+    sleep(3); /* let the pipeline drain so trailing AVMARKs are logged */
+    if (replay_loop) g_main_loop_quit(replay_loop);
+    return NULL;
+}
+static void replay_run(void) {
+    replay_loop = g_main_loop_new(NULL, FALSE);
+    if (use_video) video_renderer_listen((void *) replay_loop, 0);
+    if (use_audio) audio_renderer_listen((void *) replay_loop, 0);
+    /* Replay has no video_set_codec callback to select the active
+     * renderer -- do it here (mirror is always h264 for our use). */
+    if (use_video) video_renderer_choose_codec(false, false);
+    GThread *th = g_thread_new("replay-feeder", replay_feeder, NULL);
+    g_main_loop_run(replay_loop);
+    g_thread_join(th);
+}
+
 static bool fullscreen = false;
 static bool render_coverart = false;
 static std::string coverart_filename = "";
@@ -211,7 +372,28 @@ static GMainLoop *gmainloop = NULL;
 static bool mux_to_file = false;
 static std::string mux_filename = "recording";
 
-//Support for D-Bus-based screensaver inhibition (org.freedesktop.ScreenSaver) 
+/* Drives the real production reconnect path (video_reset()'s
+ * RESET_TYPE_RTP_SHUTDOWN handler and skip_video_rebuild). */
+extern "C" void video_reset(void *cls, reset_type_t type);
+static void replay_do_reconnect(unsigned char ct) {
+    fprintf(stderr, "replay: ===== SIMULATING RECONNECT =====\n");
+    video_reset(NULL, RESET_TYPE_RTP_SHUTDOWN);
+    if (use_audio) audio_renderer_stop();
+    if (use_video && !skip_video_rebuild) {
+        video_renderer_destroy();
+        video_renderer_init(render_logger, server_name.c_str(), videoflip, video_parser.c_str(), rtp_pipeline.c_str(),
+                            video_decoder.c_str(), video_converter.c_str(), videosink.c_str(),
+                            videosink_options.c_str(), fullscreen, video_sync, h265_support,
+                            render_coverart, playbin_version, NULL);
+        video_renderer_start();
+        video_renderer_listen((void *) replay_loop, 0);
+    }
+    if (use_audio) audio_renderer_start(&ct);
+    if (use_video) video_renderer_choose_codec(false, false);
+    fprintf(stderr, "replay: ===== RECONNECT DONE (skip_video_rebuild=%d) =====\n", (int) skip_video_rebuild);
+}
+
+//Support for D-Bus-based screensaver inhibition (org.freedesktop.ScreenSaver)
 static unsigned int scrsv = 0;
 #ifdef DBUS 
 /* these strings can be changed at startup if a non-conforming Desktop Environmemt is detected */
@@ -1638,6 +1820,14 @@ static void parse_arguments (int argc, char *argv[]) {
                     continue;
                 }
             }
+        } else if (arg == "-capture") {
+            if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
+            capture_filename = argv[++i];
+            do_capture = true;
+        } else if (arg == "-replay") {
+            if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
+            replay_filename = argv[++i];
+            do_replay = true;
         } else if (arg == "-nohold") {
             nohold = 1;
         } else if (arg == "-al") {
@@ -2381,6 +2571,7 @@ extern "C" void audio_process (void *cls, raop_ntp_t *ntp, audio_decode_struct *
         default:
             break;
         }
+        if (do_capture) cap_write('A', data->data, data->data_len, data->ntp_time_remote);
         audio_renderer_render_buffer(data->data, &(data->data_len), &(data->seqnum), &(data->ntp_time_remote));
     }
 }
@@ -2401,6 +2592,7 @@ extern "C" void video_process (void *cls, raop_ntp_t *ntp, video_decode_struct *
         uint64_t pts_mismatch = 0;
         do {
             data->ntp_time_remote = data->ntp_time_remote + remote_clock_offset;
+            if (do_capture && count == 0) cap_write('V', data->data, data->data_len, data->ntp_time_remote);
             pts_mismatch = video_renderer_render_buffer(data->data, &(data->data_len), &(data->nal_count), &(data->ntp_time_remote));
             if (pts_mismatch) {
                 LOGI("adjust timestamps by %8.6f secs", (double) pts_mismatch / SECOND_IN_NSECS);
@@ -2434,12 +2626,14 @@ extern "C" void video_resume (void *cls) {
 
 
 extern "C" void audio_flush (void *cls) {
+    if (do_capture) cap_write('a', NULL, 0, 0);
     if (use_audio) {
         audio_renderer_flush();
     }
 }
 
 extern "C" void video_flush (void *cls) {
+    if (do_capture) cap_write('v', NULL, 0, 0);
     if (use_video) {
         video_renderer_flush();
     }
@@ -2521,7 +2715,8 @@ extern "C" void audio_get_format (void *cls, unsigned char *ct, unsigned short *
         audio_dumpfile = NULL;
     }
     audio_type = type;
-    
+
+    if (do_capture) cap_write('C', NULL, 0, (uint64_t) *ct);
     if (use_audio) {
       audio_renderer_start(ct);
     }
@@ -3260,6 +3455,21 @@ int main (int argc, char *argv[]) {
             display[0] = 1920;
             display[1] = 1080;
         }	  
+    }
+
+    if (do_replay) {
+        LOGI("REPLAY MODE: feeding captured session from %s (no AirPlay)", replay_filename.c_str());
+        replay_run();
+        cleanup();
+    }
+
+    if (do_capture) {
+        capture_fp = fopen(capture_filename.c_str(), "wb");
+        if (!capture_fp) {
+            LOGE("could not open capture file %s", capture_filename.c_str());
+        } else {
+            LOGI("CAPTURE MODE: recording decrypted session to %s", capture_filename.c_str());
+        }
     }
 
     if (start_dnssd(server_hw_addr, server_name)) {
