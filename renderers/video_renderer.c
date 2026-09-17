@@ -20,6 +20,7 @@
  * Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
  */
 
+#include <stdio.h>
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
 #include "video_renderer.h"
@@ -41,6 +42,9 @@ static bool first_packet = false;
 static bool sync = false;
 static bool auto_videosink = true;
 static bool hls_video = false;
+/* Base sink name (e.g. "kmssink"), so video_renderer_set_overscan()
+ * can reconstruct each pipeline's actual per-codec sink element names. */
+static char *g_videosink_name = NULL;
 #ifdef X_DISPLAY_FIX
 static bool use_x11 = false;
 #endif
@@ -344,6 +348,8 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
     hls_video = (uri != NULL);
     /* videosink choices that are auto */
     auto_videosink = (strstr(videosink, "autovideosink") || strstr(videosink, "fpsdisplaysink"));
+    g_free(g_videosink_name);
+    g_videosink_name = g_strdup(videosink);
 
     logger = render_logger;
     logger_debug = (logger_get_level(logger) >= LOGGER_DEBUG);
@@ -631,7 +637,48 @@ void video_renderer_start() {
     g_atomic_int_set(&video_renderer_ready, 1);
 }
 
-/* used to find any X11 Window used by the playbin (HLS) pipeline after it starts playing. 
+/* Applies the given overscan margins to every live mirror-mode kmssink --
+ * render-rectangle is a live-settable GObject property, so this needs no
+ * pipeline rebuild and drops no connection. Caller owns where the margins
+ * come from (a config file, a control socket, etc) and how they're kept
+ * up to date -- this function only ever applies a fixed set of numbers. */
+void video_renderer_set_overscan(int left, int right, int top, int bottom, int screen_width, int screen_height) {
+    if (hls_video || !g_videosink_name) {
+        return; /* HLS playback doesn't build per-codec named kmssink elements this targets */
+    }
+    int w = screen_width - left - right;
+    int h = screen_height - top - bottom;
+    if (left < 0 || right < 0 || top < 0 || bottom < 0 || w <= 0 || h <= 0) {
+        logger_log(logger, LOGGER_ERR,
+                   "overscan config out of range (left=%d right=%d top=%d bottom=%d) -- "
+                   "ignoring, using full screen", left, right, top, bottom);
+        left = top = 0;
+        w = screen_width;
+        h = screen_height;
+    }
+
+    char rect[64];
+    snprintf(rect, sizeof(rect), "<%d,%d,%d,%d>", left, top, w, h);
+
+    for (int i = 0; i < n_renderers; i++) {
+        if (!renderer_type[i] || !renderer_type[i]->pipeline || !renderer_type[i]->codec) {
+            continue;
+        }
+        char name[64];
+        snprintf(name, sizeof(name), "%s_%s", g_videosink_name, renderer_type[i]->codec);
+        GstElement *sink = gst_bin_get_by_name(GST_BIN(renderer_type[i]->pipeline), name);
+        if (!sink) {
+            continue;
+        }
+        if (g_object_class_find_property(G_OBJECT_GET_CLASS(sink), "render-rectangle")) {
+            gst_util_set_object_arg(G_OBJECT(sink), "render-rectangle", rect);
+            logger_log(logger, LOGGER_INFO, "overscan: set %s render-rectangle to %s", name, rect);
+        }
+        gst_object_unref(sink);
+    }
+}
+
+/* used to find any X11 Window used by the playbin (HLS) pipeline after it starts playing.
 *  if use_x11 is true, called every 100 ms after playbin state is READY until the x11 window is found*/
 bool waiting_for_x11_window() {
     if (!hls_video) {

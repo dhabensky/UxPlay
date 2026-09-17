@@ -36,8 +36,13 @@ endif()
 pkg_check_modules(GLIB2 REQUIRED glib-2.0)
 if (${GLIB2_VERSION} VERSION_LESS "2.68")
    message(STATUS "GLib2 < 2.68: Need a replacement for g_string_replace")
-   add_definitions( -DNEED_G_STRING_REPLACE )   
+   add_definitions( -DNEED_G_STRING_REPLACE )
 endif()
+
+# GFileMonitor (live overscan-config reload, see uxplay.cpp's main_loop()) is
+# part of GIO, a separate library from GLib itself -- not pulled in
+# transitively by glib-2.0 or gstreamer-1.0's own link requirements.
+pkg_check_modules(GIO2 REQUIRED gio-2.0)
 
 pkg_check_modules(GST REQUIRED    gstreamer-1.0>=1.4 
                                   gstreamer-sdp-1.0>=1.4
@@ -52,6 +57,8 @@ add_library( renderers
              mux_renderer.c )
 
 target_link_libraries ( renderers PUBLIC airplay )
+target_link_libraries ( renderers PUBLIC ${GIO2_LIBRARIES} )
+target_include_directories ( renderers PUBLIC ${GIO2_INCLUDE_DIRS} )
 
 # hacks to fix cmake confusion due to links in path with macOS FrameWorks
 

@@ -50,6 +50,8 @@
 #include <ifaddrs.h>
 #include <sys/types.h>
 #include <pwd.h>
+#include <fcntl.h>
+#include <cerrno>
 # ifdef __linux__
 # include <netpacket/packet.h>
 # else
@@ -124,6 +126,13 @@ static bool full_video_reset = true;
  * ~100ms to resume vs. ~5s of frozen video for a full rebuild, on real
  * Pi hardware (renegotiation cost, not a decoder wedge -- see video_reset). */
 static bool skip_video_rebuild = false;
+/* Initial overscan margins (-overscan l:r:t:b) and an optional FIFO
+ * (-ofifo) a wrapper can write "l r t b\n" to for a live update -- see
+ * overscan_fifo_open_and_watch(). UxPlay owns none of the policy of
+ * where these numbers come from, only applying them (video_renderer). */
+static int overscan_left = 0, overscan_right = 0, overscan_top = 0, overscan_bottom = 0;
+static std::string overscan_fifo_path;
+static GIOChannel *overscan_fifo_channel = NULL;
 static std::string video_parser = "h264parse";
 static std::string video_decoder = "decodebin";
 static std::string video_converter = "videoconvert";
@@ -810,6 +819,41 @@ static gboolean sighup_callback(gpointer loop) {
     g_main_loop_quit((GMainLoop *) loop);
     return TRUE;
 }
+
+static void overscan_fifo_open_and_watch();
+
+/* A FIFO stays "readable" (EOF) after its writer closes until reopened --
+ * reopen on every EOF instead of spinning on a permanently-ready, no-data fd. */
+static gboolean overscan_fifo_watch_callback(GIOChannel *source, GIOCondition condition, gpointer data) {
+    (void) condition; (void) data;
+    int fd = g_io_channel_unix_get_fd(source);
+    char line[128];
+    ssize_t n = read(fd, line, sizeof(line) - 1);
+    if (n > 0) {
+        line[n] = '\0';
+        int left, right, top, bottom;
+        if (sscanf(line, "%d %d %d %d", &left, &right, &top, &bottom) == 4) {
+            video_renderer_set_overscan(left, right, top, bottom, display[0], display[1]);
+        }
+        return TRUE;
+    }
+    g_io_channel_shutdown(source, FALSE, NULL);
+    g_io_channel_unref(source);
+    overscan_fifo_open_and_watch();
+    return G_SOURCE_REMOVE;
+}
+
+static void overscan_fifo_open_and_watch() {
+    int fd = open(overscan_fifo_path.c_str(), O_RDONLY | O_NONBLOCK);
+    if (fd < 0) {
+        LOGE("could not open overscan fifo %s: %s", overscan_fifo_path.c_str(), strerror(errno));
+        overscan_fifo_channel = NULL;
+        return;
+    }
+    overscan_fifo_channel = g_io_channel_unix_new(fd);
+    g_io_channel_set_close_on_unref(overscan_fifo_channel, TRUE);
+    g_io_add_watch(overscan_fifo_channel, G_IO_IN, overscan_fifo_watch_callback, NULL);
+}
 #endif
 
 static void display_progress(uint32_t start, uint32_t curr, uint32_t end) {
@@ -950,6 +994,15 @@ static void main_loop()  {
     guint sigterm_watch_id = g_unix_signal_add(SIGTERM, (GSourceFunc) sigterm_callback, (gpointer) loop);
     guint sigint_watch_id = g_unix_signal_add(SIGINT, (GSourceFunc) sigint_callback, (gpointer) loop);
     guint sighup_watch_id = g_unix_signal_add(SIGHUP, (GSourceFunc) sigint_callback, (gpointer) loop);
+    /* Process lifetime, not per-client, so overscan is tunable live
+     * whether or not anyone is currently mirroring. */
+    if (!overscan_fifo_path.empty()) {
+        if (mkfifo(overscan_fifo_path.c_str(), 0600) < 0 && errno != EEXIST) {
+            LOGE("could not create overscan fifo %s: %s", overscan_fifo_path.c_str(), strerror(errno));
+        } else {
+            overscan_fifo_open_and_watch();
+        }
+    }
 #endif
     g_main_loop_run(loop);
 
@@ -962,6 +1015,11 @@ static void main_loop()  {
     if (sigint_watch_id > 0) g_source_remove(sigint_watch_id);
     if (sigterm_watch_id > 0) g_source_remove(sigterm_watch_id);
     if (sighup_watch_id > 0) g_source_remove(sighup_watch_id);
+    if (overscan_fifo_channel) {
+        g_io_channel_shutdown(overscan_fifo_channel, FALSE, NULL);
+        g_io_channel_unref(overscan_fifo_channel);
+        overscan_fifo_channel = NULL;
+    }
 #endif
 
     for (int i = 0; i < n_video_renderers; i++) {
@@ -1166,6 +1224,9 @@ static void print_info (char *name) {
     printf("-s wxh[@r]Request to client for video display resolution [refresh_rate]\n"); 
     printf("          default 1920x1080[@60] (or 3840x2160[@60] with -h265 option)\n");
     printf("-o        Set display \"overscanned\" mode on (not usually needed)\n");
+    printf("-overscan l:r:t:b  Compensate for a display cropping the picture's\n");
+    printf("          edges; margins in pixels, default 0:0:0:0 (none)\n");
+    printf("-ofifo fn Read \"l r t b\\n\" lines from FIFO fn for a live overscan update\n");
     printf("-fs       Full-screen (only with X11, Wayland, VAAPI, D3D11/12, kms)\n");
     printf("-p        Use legacy ports UDP 6000:6001:7011 TCP 7000:7001:7100\n");
     printf("-p n      Use TCP and UDP ports n,n+1,n+2. range %d-%d\n", LOWEST_ALLOWED_PORT, HIGHEST_PORT);
@@ -1977,6 +2038,22 @@ static void parse_arguments (int argc, char *argv[]) {
             h265_support = true;
         } else if (arg == "-nofreeze") {
             nofreeze = true;
+        } else if (arg == "-overscan") {
+            if (i == argc - 1) {
+                fprintf(stderr, "invalid \"-overscan\": expected \"left:right:top:bottom\" (pixels)\n");
+                exit(1);
+            }
+            i++;
+            if (sscanf(argv[i], "%d:%d:%d:%d", &overscan_left, &overscan_right, &overscan_top, &overscan_bottom) != 4) {
+                fprintf(stderr, "invalid \"-overscan %s\": expected \"left:right:top:bottom\" (pixels)\n", argv[i]);
+                exit(1);
+            }
+        } else if (arg == "-ofifo") {
+            if (i == argc - 1) {
+                fprintf(stderr, "invalid \"-ofifo\": expected a file path\n");
+                exit(1);
+            }
+            overscan_fifo_path = argv[++i];
         } else {
             fprintf(stderr, "unknown option %s, stopping (for help use option \"-h\")\n",argv[i]);
             exit(1);
@@ -3454,7 +3531,13 @@ int main (int argc, char *argv[]) {
         } else {
             display[0] = 1920;
             display[1] = 1080;
-        }	  
+        }
+    }
+
+    if (use_video) {
+        /* Apply the initial (-overscan) config before any client connects;
+         * -ofifo (if set) additionally applies later, live updates. */
+        video_renderer_set_overscan(overscan_left, overscan_right, overscan_top, overscan_bottom, display[0], display[1]);
     }
 
     if (do_replay) {
