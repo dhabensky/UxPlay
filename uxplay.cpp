@@ -2402,9 +2402,11 @@ extern "C" void audio_set_volume (void *cls, float volume) {
     } else if (volume < -30.0f) {
         LOGE(" invalid AirPlay volume %f", volume);
         frac = 0.0;
+        volume = -30.0f;
     } else if (volume > 0.0f) {
         LOGE(" invalid AirPlay volume %f", volume);
         frac = 1.0;
+        volume = 0.0f;
     } else if (volume == -30.0f) {
         frac = 0.0;
     } else if (volume == 0.0f) {
@@ -2413,6 +2415,11 @@ extern "C" void audio_set_volume (void *cls, float volume) {
         frac = (double) ( (30.0f + volume) / 30.0f);
         frac = (frac > 1.0) ? 1.0 : frac;
     }
+
+    /* Record the real current volume so a later GET_PARAMETER (or a new
+     * connection's own initial query) reports what's actually playing,
+     * not the "-vol" startup default forever. */
+    initial_volume = volume;
 
     /* frac is length of volume slider as fraction of max length */
     /* also (steps/16) where steps is number of discrete steps above mute (16 = full volume) */
