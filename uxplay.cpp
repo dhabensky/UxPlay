@@ -120,6 +120,10 @@ static bool new_window_closing_behavior = true;
 #endif
 static bool close_window;
 static bool full_video_reset = true;
+/* Skip the destroy+recreate cycle on a plain mirror reconnect: measured
+ * ~100ms to resume vs. ~5s of frozen video for a full rebuild, on real
+ * Pi hardware (renegotiation cost, not a decoder wedge -- see video_reset). */
+static bool skip_video_rebuild = false;
 static std::string video_parser = "h264parse";
 static std::string video_decoder = "decodebin";
 static std::string video_converter = "videoconvert";
@@ -697,6 +701,7 @@ static void main_loop()  {
     reset_loop = false;
     reset_httpd = false;
     preserve_connections = false;
+    skip_video_rebuild = false;
     n_video_renderers = 0;
     n_audio_renderers = 0;
     if (use_video) {
@@ -2190,9 +2195,16 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
         LOGD("video_reset: type = RTP_to_HLS_Shutdown");
         preserve_connections = true;
     case RESET_TYPE_RTP_SHUTDOWN:
-        LOGD("video_reset: type = RTP_Shutdown");      
+        LOGD("video_reset: type = RTP_Shutdown");
         if (use_video) {
-            video_renderer_stop();
+            if (!hls_support && !preserve_connections) {
+                /* Leave the pipeline running instead of destroy()+init():
+                 * measured ~100ms to resume vs. ~5s of frozen video for a
+                 * full rebuild (renegotiation cost), on real Pi hardware. */
+                skip_video_rebuild = true;
+            } else {
+                video_renderer_stop();
+            }
         }
         remote_clock_offset = 0;
         relaunch_video = true;
@@ -3292,7 +3304,7 @@ int main (int argc, char *argv[]) {
         if (use_audio) {
             audio_renderer_stop();
         }
-        if (use_video && (close_window || preserve_connections || full_video_reset)) {
+        if (use_video && !skip_video_rebuild && (close_window || preserve_connections || full_video_reset)) {
             video_renderer_destroy();
             if (!preserve_connections) {
                 url.erase();
