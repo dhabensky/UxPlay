@@ -41,6 +41,11 @@ DNSSD_API int dnssd_register_airplay(dnssd_t *dnssd, unsigned short port);
 DNSSD_API void dnssd_unregister_raop(dnssd_t *dnssd);
 DNSSD_API void dnssd_unregister_airplay(dnssd_t *dnssd);
 
+/* Unregister+register both services again, for periodic refresh -- safe
+ * to call repeatedly, unlike unregister_raop/airplay + register_raop/
+ * airplay (see dnssd.c). */
+DNSSD_API int dnssd_reregister(dnssd_t *dnssd, unsigned short raop_port, unsigned short airplay_port);
+
 DNSSD_API const char *dnssd_get_raop_txt(dnssd_t *dnssd, int *length);
 DNSSD_API const char *dnssd_get_airplay_txt(dnssd_t *dnssd, int *length);
 DNSSD_API const char *dnssd_get_name(dnssd_t *dnssd, int *length);

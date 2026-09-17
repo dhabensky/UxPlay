@@ -479,6 +479,27 @@ dnssd_unregister_airplay(dnssd_t *dnssd)
     }
 }
 
+int
+dnssd_reregister(dnssd_t *dnssd, unsigned short raop_port, unsigned short airplay_port)
+{
+    /* Unlike unregister_raop/airplay, deliberately doesn't free
+     * dnssd->name/hw_addr -- register_raop/airplay need them again. */
+    assert(dnssd);
+    if (dnssd->raop_service) {
+        dnssd->TXTRecordDeallocate(&dnssd->raop_record);
+        dnssd->DNSServiceRefDeallocate(dnssd->raop_service);
+        dnssd->raop_service = NULL;
+    }
+    if (dnssd->airplay_service) {
+        dnssd->TXTRecordDeallocate(&dnssd->airplay_record);
+        dnssd->DNSServiceRefDeallocate(dnssd->airplay_service);
+        dnssd->airplay_service = NULL;
+    }
+    int err = dnssd_register_raop(dnssd, raop_port);
+    if (err) return err;
+    return dnssd_register_airplay(dnssd, airplay_port);
+}
+
 uint64_t dnssd_get_airplay_features(dnssd_t *dnssd) {
     uint64_t features = ((uint64_t) dnssd->features2) << 32;
     features += (uint64_t) dnssd->features1;

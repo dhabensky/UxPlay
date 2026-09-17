@@ -65,6 +65,7 @@
 #include "lib/logger.h"
 #include "lib/dnssd.h"
 #include "lib/crypto.h"
+#include "lib/netlink_addr_watch.h"
 #include "renderers/video_renderer.h"
 #include "renderers/audio_renderer.h"
 #include "renderers/mux_renderer.h"
@@ -664,6 +665,26 @@ static gboolean video_eos_watch_callback (gpointer loop) {
     return TRUE;
 }
 
+static gboolean dnssd_refresh_callback (gpointer loop) {
+    /* Fallback for kernels without netlink support (see main_loop()):
+     * avahi drops our records on any address event (e.g. a DHCP renewal),
+     * silently, so periodically re-publish to stay visible regardless. */
+    dnssd_reregister(dnssd, raop_port, airplay_port);
+    return TRUE;
+}
+
+static gboolean dnssd_netlink_watch_callback (GIOChannel *source, GIOCondition condition, gpointer data) {
+    int fd = g_io_channel_unix_get_fd(source);
+    unsigned char buf[4096];
+    ssize_t n = recv(fd, buf, sizeof(buf), 0);
+    if (n > 0 && netlink_addr_watch_is_addr_change(buf, (size_t) n)) {
+        /* avahi drops our records on this event (e.g. a DHCP renewal),
+         * silently -- re-publish so we stay visible. */
+        dnssd_reregister(dnssd, raop_port, airplay_port);
+    }
+    return TRUE;
+}
+
 #define MAX_VIDEO_RENDERERS 3
 #define MAX_AUDIO_RENDERERS 2
 static void main_loop()  {
@@ -718,6 +739,19 @@ static void main_loop()  {
     missed_feedback = 0;
     guint feedback_watch_id = g_timeout_add_seconds(1, (GSourceFunc) feedback_callback, (gpointer) loop);
     guint reset_watch_id = g_timeout_add(100, (GSourceFunc) reset_callback, (gpointer) loop);
+    /* React to address-change events (e.g. a DHCP renewal) as they happen,
+     * instead of blindly polling. Falls back to polling if the kernel has
+     * no netlink support. */
+    guint dnssd_refresh_watch_id = 0;
+    GIOChannel *dnssd_netlink_channel = NULL;
+    int dnssd_netlink_fd = netlink_addr_watch_open();
+    if (dnssd_netlink_fd >= 0) {
+        dnssd_netlink_channel = g_io_channel_unix_new(dnssd_netlink_fd);
+        g_io_channel_set_close_on_unref(dnssd_netlink_channel, TRUE);
+        g_io_add_watch(dnssd_netlink_channel, G_IO_IN, dnssd_netlink_watch_callback, (gpointer) loop);
+    } else {
+        dnssd_refresh_watch_id = g_timeout_add_seconds(300, (GSourceFunc) dnssd_refresh_callback, (gpointer) loop);
+    }
 
 #ifdef _WIN32
     gmainloop = loop;
@@ -753,8 +787,13 @@ static void main_loop()  {
     if (progress_id > 0) g_source_remove(progress_id);
     if (video_eos_watch_id > 0) g_source_remove(video_eos_watch_id);
     if (feedback_watch_id > 0) g_source_remove(feedback_watch_id);
+    if (dnssd_refresh_watch_id > 0) g_source_remove(dnssd_refresh_watch_id);
+    if (dnssd_netlink_channel) {
+        g_io_channel_shutdown(dnssd_netlink_channel, FALSE, NULL);
+        g_io_channel_unref(dnssd_netlink_channel); /* closes dnssd_netlink_fd (close_on_unref) */
+    }
     g_main_loop_unref(loop);
-}    
+}
 
 static int parse_hw_addr (std::string str, std::vector<char> &hw_addr) {
     for (int i = 0; i < (int) str.length(); i += 3) {
