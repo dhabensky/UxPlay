@@ -33,7 +33,14 @@
 #include "utils.h"
 #include "byteutils.h"
 
+#include <time.h>
+
 #define RAOP_BUFFER_LENGTH 256
+
+/* Without a rate limit, a still-missing packet gets a brand new resend
+ * request on every select() wakeup, flooding the control channel. Only
+ * suppresses repeat requests for the *same* gap, not the first one. */
+#define RAOP_RESEND_MIN_INTERVAL_NS 100000000ULL /* 100ms */
 
 typedef struct {
     /* Data available */
@@ -59,6 +66,12 @@ struct raop_buffer_s {
     int is_empty;
     unsigned short first_seqnum;
     unsigned short last_seqnum;
+
+    /* Rate limiting (RAOP_RESEND_MIN_INTERVAL_NS). Plain bool, not
+     * last_resend_request_ns == 0: CLOCK_MONOTONIC's epoch can be 0. */
+    bool last_resend_requested;
+    unsigned short last_resend_first_seqnum;
+    uint64_t last_resend_request_ns;
 
     /* RTP buffer entries */
     raop_buffer_entry_t entries[RAOP_BUFFER_LENGTH];
@@ -283,6 +296,19 @@ void raop_buffer_handle_resends(raop_buffer_t *raop_buffer, raop_resend_cb_t res
 	    count++;
         }
         if (count){
+            /* A new gap (first_seqnum changed) always fires immediately;
+             * the same gap only re-fires after the rate-limit interval. */
+            struct timespec now_ts;
+            clock_gettime(CLOCK_MONOTONIC, &now_ts);
+            uint64_t now_ns = (uint64_t) now_ts.tv_sec * 1000000000ULL + (uint64_t) now_ts.tv_nsec;
+            bool same_gap = raop_buffer->last_resend_requested &&
+                             raop_buffer->last_resend_first_seqnum == raop_buffer->first_seqnum;
+            if (same_gap && (now_ns - raop_buffer->last_resend_request_ns) < RAOP_RESEND_MIN_INTERVAL_NS) {
+                return;
+            }
+            raop_buffer->last_resend_requested = true;
+            raop_buffer->last_resend_first_seqnum = raop_buffer->first_seqnum;
+            raop_buffer->last_resend_request_ns = now_ns;
             resend_cb(opaque, raop_buffer->first_seqnum, count);
         }
     }
