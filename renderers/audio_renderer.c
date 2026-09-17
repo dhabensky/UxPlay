@@ -319,9 +319,11 @@ void audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned s
         if (pts >= gst_audio_pipeline_base_time) {
             pts -= gst_audio_pipeline_base_time;
         } else {
-            logger_log(logger, LOGGER_ERR, "*** invalid ntp_time < gst_audio_pipeline_base_time\n%8.6f ntp_time\n%8.6f base_time",
-                       ((double) *ntp_time) / SECOND_IN_NSECS, ((double) gst_audio_pipeline_base_time) / SECOND_IN_NSECS);
-            return;
+            /* Clock jump from a seek/reconnect, not a corrupt timestamp --
+             * re-base instead of dropping all audio from here on. */
+            logger_log(logger, LOGGER_DEBUG, "audio ntp < base_time; re-basing audio clock (seek/reconnect)");
+            gst_audio_pipeline_base_time = pts;
+            pts = 0;
         }
     }
     if (data_len == 0 || renderer == NULL) return;
