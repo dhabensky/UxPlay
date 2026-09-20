@@ -69,6 +69,10 @@ void video_renderer_flush ();
 unsigned int video_renderer_listen(void *loop, int id);
 void video_renderer_destroy ();
 void video_renderer_set_overscan(int left, int right, int top, int bottom, int screen_width, int screen_height);
+/* Hides live mirror video (moves it off-screen, no pipeline/element state
+ * change) so the DRM primary plane's idle menu shows through. Deferred and
+ * epoch-guarded internally -- safe to call from any thread. */
+void video_renderer_release_display(void);
 void video_renderer_size(float *width_source, float *height_source, float *width, float *height);
 bool waiting_for_x11_window();
 bool video_get_playback_info(double *duration, double *position, double *seek_start, double *seek_duration, float *rate, bool *buffer_empty, bool *buffer_full);

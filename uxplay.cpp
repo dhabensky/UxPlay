@@ -2519,6 +2519,7 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
                  * measured ~100ms to resume vs. ~5s of frozen video for a
                  * full rebuild (renegotiation cost), on real Pi hardware. */
                 skip_video_rebuild = true;
+                video_renderer_release_display();
             } else {
                 video_renderer_stop();
             }

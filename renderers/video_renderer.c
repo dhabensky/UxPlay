@@ -24,6 +24,7 @@
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
 #include <gst/video/gstvideodecoder.h>
+#include <gst/video/videooverlay.h>
 #include "video_renderer.h"
 
 #define SECOND_IN_NSECS 1000000000UL
@@ -108,6 +109,15 @@ static video_renderer_t *renderer_type[NCODECS] = {0};
  * pushing buffers to an appsrc still mid-transition (real crash). */
 static gint video_renderer_ready = 0;
 static int n_renderers = NCODECS;
+/* Bumped every time choose_codec() (re)confirms PLAYING; lets a deferred
+ * video_renderer_release_display_cb() detect a reconnect that raced ahead
+ * of it and no-op instead of re-hiding a picture the reconnect restored. */
+static gint video_connect_epoch = 0;
+/* Last rect/screen size applied via video_renderer_set_overscan(), so
+ * choose_codec() can restore the real picture after a release_display()
+ * hid it, without uxplay.cpp having to pass overscan margins through again. */
+static char cached_overscan_rect[64] = "<0,0,1920,1080>";
+static int cached_screen_w = 1920, cached_screen_h = 1080;
 static char h264[] = "h264";
 static char h265[] = "h265";
 static char hls[]  = "hls";
@@ -711,29 +721,16 @@ void video_renderer_start() {
     g_atomic_int_set(&video_renderer_ready, 1);
 }
 
-/* Applies the given overscan margins to every live mirror-mode kmssink --
- * render-rectangle is a live-settable GObject property, so this needs no
- * pipeline rebuild and drops no connection. Caller owns where the margins
- * come from (a config file, a control socket, etc) and how they're kept
- * up to date -- this function only ever applies a fixed set of numbers. */
-void video_renderer_set_overscan(int left, int right, int top, int bottom, int screen_width, int screen_height) {
+/* Sets "render-rectangle" on every live mirror-mode kmssink -- a plain
+ * property set alone only takes effect the next time kmssink renders a
+ * buffer. force_redraw also calls gst_video_overlay_expose(), which
+ * re-runs show_frame() against the last held buffer with no new buffer
+ * needed -- for hiding video while no client is connected and nothing
+ * new is about to be pushed to appsrc. */
+static void apply_render_rectangle(const char *rect, gboolean force_redraw) {
     if (hls_video || !g_videosink_name) {
         return; /* HLS playback doesn't build per-codec named kmssink elements this targets */
     }
-    int w = screen_width - left - right;
-    int h = screen_height - top - bottom;
-    if (left < 0 || right < 0 || top < 0 || bottom < 0 || w <= 0 || h <= 0) {
-        logger_log(logger, LOGGER_ERR,
-                   "overscan config out of range (left=%d right=%d top=%d bottom=%d) -- "
-                   "ignoring, using full screen", left, right, top, bottom);
-        left = top = 0;
-        w = screen_width;
-        h = screen_height;
-    }
-
-    char rect[64];
-    snprintf(rect, sizeof(rect), "<%d,%d,%d,%d>", left, top, w, h);
-
     for (int i = 0; i < n_renderers; i++) {
         if (!renderer_type[i] || !renderer_type[i]->pipeline || !renderer_type[i]->codec) {
             continue;
@@ -746,10 +743,75 @@ void video_renderer_set_overscan(int left, int right, int top, int bottom, int s
         }
         if (g_object_class_find_property(G_OBJECT_GET_CLASS(sink), "render-rectangle")) {
             gst_util_set_object_arg(G_OBJECT(sink), "render-rectangle", rect);
-            logger_log(logger, LOGGER_INFO, "overscan: set %s render-rectangle to %s", name, rect);
+            logger_log(logger, LOGGER_INFO, "video renderer: set %s render-rectangle to %s", name, rect);
+            if (force_redraw && GST_IS_VIDEO_OVERLAY(sink)) {
+                gst_video_overlay_expose(GST_VIDEO_OVERLAY(sink));
+            }
         }
         gst_object_unref(sink);
     }
+}
+
+/* Applies the given overscan margins to every live mirror-mode kmssink --
+ * render-rectangle is a live-settable GObject property, so this needs no
+ * pipeline rebuild and drops no connection. Caller owns where the margins
+ * come from (a config file, a control socket, etc) and how they're kept
+ * up to date -- this function only ever applies a fixed set of numbers. */
+void video_renderer_set_overscan(int left, int right, int top, int bottom, int screen_width, int screen_height) {
+    int w = screen_width - left - right;
+    int h = screen_height - top - bottom;
+    if (left < 0 || right < 0 || top < 0 || bottom < 0 || w <= 0 || h <= 0) {
+        logger_log(logger, LOGGER_ERR,
+                   "overscan config out of range (left=%d right=%d top=%d bottom=%d) -- "
+                   "ignoring, using full screen", left, right, top, bottom);
+        left = top = 0;
+        w = screen_width;
+        h = screen_height;
+    }
+    cached_screen_w = screen_width; cached_screen_h = screen_height;
+
+    char rect[64];
+    snprintf(rect, sizeof(rect), "<%d,%d,%d,%d>", left, top, w, h);
+    snprintf(cached_overscan_rect, sizeof(cached_overscan_rect), "%s", rect);
+    apply_render_rectangle(rect, FALSE);
+}
+
+/* Deferred body of video_renderer_release_display(); runs on the main
+ * thread's GMainLoop (or -replay's replay_loop), never inline on whatever
+ * thread detected the teardown -- a synchronous gst_video_overlay_expose()
+ * on the httpd thread previously turned a free flag-set into a blocking DRM
+ * call on the client-visible TEARDOWN round-trip (docs/bugs/2026-09-13-
+ * audio-resume-latency-after-teardown.md). scheduled_epoch guards against a
+ * reconnect that raced ahead of this callback and already restored the
+ * picture -- re-hiding it then would be wrong. */
+static gboolean video_renderer_release_display_cb(gpointer data) {
+    guint scheduled_epoch = GPOINTER_TO_UINT(data);
+    if ((guint) g_atomic_int_get(&video_connect_epoch) != scheduled_epoch) {
+        logger_log(logger, LOGGER_INFO,
+                   "release_display: epoch changed since scheduling (reconnect raced ahead), skipping hide");
+        return G_SOURCE_REMOVE;
+    }
+    /* Full-size rectangle shifted off the left edge: a degenerate <0,0,1,1>
+     * rect makes gst_video_sink_center_rect()'s aspect-preserving fit round
+     * to <=0 and kmssink silently skips the DRM commit. Only the right/
+     * bottom edges are clamped, never a negative left edge, so this one
+     * paints somewhere the CRTC can't see it. */
+    char rect[64];
+    snprintf(rect, sizeof(rect), "<%d,%d,%d,%d>", -cached_screen_w, 0, cached_screen_w, cached_screen_h);
+    apply_render_rectangle(rect, TRUE);
+    logger_log(logger, LOGGER_INFO, "release_display: hid video, epoch %u", scheduled_epoch);
+    return G_SOURCE_REMOVE;
+}
+
+/* Hides live mirror video (moves it off-screen so the DRM primary plane's
+ * idle menu shows through) on an explicit disconnect, without touching
+ * pipeline/element state -- callable from any thread. The real work is
+ * deferred to the main loop and epoch-guarded; see
+ * video_renderer_release_display_cb(). choose_codec() restores the real
+ * picture once a new connection actually starts decoding. */
+void video_renderer_release_display(void) {
+    guint epoch = (guint) g_atomic_int_get(&video_connect_epoch);
+    g_idle_add(video_renderer_release_display_cb, GUINT_TO_POINTER(epoch));
 }
 
 /* used to find any X11 Window used by the playbin (HLS) pipeline after it starts playing.
@@ -1303,6 +1365,12 @@ int video_renderer_choose_codec (bool video_is_jpeg, bool video_is_h265) {
     /* Refresh base_time (it changes if the pipeline was restarted from
      * NULL after a reconnect) so the ntp->pts mapping stays correct. */
     gst_video_pipeline_base_time = gst_element_get_base_time(renderer_used->appsrc);
+    /* A real connection is (re)confirmed PLAYING -- bump the epoch so any
+     * release_display_cb() still scheduled from a stale disconnect no-ops,
+     * and restore the picture in case that disconnect already hid it.
+     * Unconditional and idempotent: harmless on a same-codec re-confirm. */
+    g_atomic_int_inc(&video_connect_epoch);
+    apply_render_rectangle(cached_overscan_rect, FALSE);
     if (renderer_used == renderer) {
         return 0; /* was already the active renderer (now re-confirmed PLAYING) */
     }
