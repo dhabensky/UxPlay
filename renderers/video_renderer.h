@@ -73,6 +73,9 @@ void video_renderer_set_overscan(int left, int right, int top, int bottom, int s
  * change) so the DRM primary plane's idle menu shows through. Deferred and
  * epoch-guarded internally -- safe to call from any thread. */
 void video_renderer_release_display(void);
+/* Blanks the primary plane (/dev/fb0) to black; call once per new mirroring
+ * connection. Content-agnostic, deferred internally -- safe from any thread. */
+void video_renderer_blank_primary_plane(void);
 void video_renderer_size(float *width_source, float *height_source, float *width, float *height);
 bool waiting_for_x11_window();
 bool video_get_playback_info(double *duration, double *position, double *seek_start, double *seek_duration, float *rate, bool *buffer_empty, bool *buffer_full);

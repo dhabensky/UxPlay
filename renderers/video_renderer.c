@@ -814,6 +814,47 @@ void video_renderer_release_display(void) {
     g_idle_add(video_renderer_release_display_cb, GUINT_TO_POINTER(epoch));
 }
 
+/* Zeros /dev/fb0, sized from sysfs geometry -- same technique as zero-fb0
+ * (image-builder/files/usr/local/bin/zero-fb0), reimplemented in C so this
+ * library never shells out to a deployment script. A plain byte write, not
+ * a DRM/kmssink call: targets the primary plane (86), which this pipeline's
+ * kmssink never touches. */
+static gboolean blank_primary_plane_cb(gpointer data) {
+    (void) data;
+    unsigned int w = 0, h = 0, bpp = 0;
+    FILE *f = fopen("/sys/class/graphics/fb0/virtual_size", "r");
+    if (!f) return G_SOURCE_REMOVE;
+    int got = fscanf(f, "%u,%u", &w, &h);
+    fclose(f);
+    f = fopen("/sys/class/graphics/fb0/bits_per_pixel", "r");
+    if (f) {
+        got += fscanf(f, "%u", &bpp);
+        fclose(f);
+    }
+    if (got != 3 || bpp == 0) return G_SOURCE_REMOVE;
+
+    size_t size = (size_t) w * h * bpp / 8;
+    FILE *fb = fopen("/dev/fb0", "wb");
+    if (!fb) return G_SOURCE_REMOVE;
+    void *zeros = calloc(1, size);
+    if (zeros) {
+        if (fwrite(zeros, 1, size, fb) != size) {
+            logger_log(logger, LOGGER_ERR, "blank_primary_plane: short write to /dev/fb0");
+        }
+        free(zeros);
+    }
+    fclose(fb);
+    return G_SOURCE_REMOVE;
+}
+
+/* Blanks the primary plane to black when a new mirroring connection starts,
+ * so no stale content already on it bleeds through a non-16:9 source's
+ * pillarbox margins. Deferred via g_idle_add like video_renderer_release_
+ * display(), since this can be called from the RAOP mirror thread. */
+void video_renderer_blank_primary_plane(void) {
+    g_idle_add(blank_primary_plane_cb, NULL);
+}
+
 /* used to find any X11 Window used by the playbin (HLS) pipeline after it starts playing.
 *  if use_x11 is true, called every 100 ms after playbin state is READY until the x11 window is found*/
 bool waiting_for_x11_window() {
@@ -1374,6 +1415,7 @@ int video_renderer_choose_codec (bool video_is_jpeg, bool video_is_h265) {
     if (renderer_used == renderer) {
         return 0; /* was already the active renderer (now re-confirmed PLAYING) */
     }
+    video_renderer_blank_primary_plane(); /* new connection: clear any stale primary-plane content */
     logger_log(logger, LOGGER_DEBUG, "video_pipeline state change from %s to %s\n",
                gst_element_state_get_name (old_state),gst_element_state_get_name (new_state));
     if (strstr(renderer_used->codec, h265)) {
