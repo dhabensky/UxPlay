@@ -863,8 +863,8 @@ static gboolean sighup_callback(gpointer loop) {
 
 static void overscan_fifo_open_and_watch();
 
-/* A FIFO stays "readable" (EOF) after its writer closes until reopened --
- * reopen on every EOF instead of spinning on a permanently-ready, no-data fd. */
+/* Real EOF (n==0) should be rare now that our own fd holds a writer
+ * reference (see O_RDWR below) -- reopen defensively if it ever happens. */
 static gboolean overscan_fifo_watch_callback(GIOChannel *source, GIOCondition condition, gpointer data) {
     (void) condition; (void) data;
     int fd = g_io_channel_unix_get_fd(source);
@@ -885,7 +885,10 @@ static gboolean overscan_fifo_watch_callback(GIOChannel *source, GIOCondition co
 }
 
 static void overscan_fifo_open_and_watch() {
-    int fd = open(overscan_fifo_path.c_str(), O_RDONLY | O_NONBLOCK);
+    /* O_RDWR (not O_RDONLY) keeps our own fd as a permanent writer reference.
+     * Measured: with O_RDONLY, once uxplay-overscan-sync's one-shot writer
+     * closes, poll() stops blocking here -- busy-loops the main loop. */
+    int fd = open(overscan_fifo_path.c_str(), O_RDWR | O_NONBLOCK);
     if (fd < 0) {
         LOGE("could not open overscan fifo %s: %s", overscan_fifo_path.c_str(), strerror(errno));
         overscan_fifo_channel = NULL;
