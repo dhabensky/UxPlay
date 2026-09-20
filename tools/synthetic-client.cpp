@@ -20,6 +20,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -175,6 +176,10 @@ bool handshake(int sock, int &cseq, fairplay_t **out_myfp) {
     unsigned char fp2[164];
     get_random_bytes(fp2, sizeof(fp2));
     fp2[4] = 0x03;
+    /* byte 12 selects one of 4 playfair mode tables (omg_hax.c's
+     * decryptMessage()) -- left random, fairplay_decrypt() reads out of
+     * bounds and derives a different aeskey per side. Must match fp1's mode. */
+    fp2[12] = 0x00;
     rtsp_request(sock, "POST", "/fp-setup", cseq++, fp2, sizeof(fp2), resp);
     fairplay_t *myfp = fairplay_init(NULL);
     unsigned char scratch142[142], scratch32[32];
@@ -184,11 +189,11 @@ bool handshake(int sock, int &cseq, fairplay_t **out_myfp) {
     return true;
 }
 
-void teardown(int sock, int &cseq) {
+void teardown(int sock, int &cseq, uint64_t stream_type = 96) {
     plist_t td = plist_new_dict();
     plist_t td_streams = plist_new_array();
     plist_t td_stream = plist_new_dict();
-    plist_dict_set_item(td_stream, "type", plist_new_uint(96));
+    plist_dict_set_item(td_stream, "type", plist_new_uint(stream_type));
     plist_array_append_item(td_streams, td_stream);
     plist_dict_set_item(td, "streams", td_streams);
     std::vector<unsigned char> td_body;
@@ -245,6 +250,332 @@ uint64_t do_setup(int sock, int &cseq, bool first_setup, unsigned short my_contr
     }
     if (!dport || !cport) return 0;
     return (dport << 32) | cport;
+}
+
+/* --- mirror-mode (video) support -----------------------------------------
+ * type=110 SETUP opens a *second* TCP connection carrying [128-byte
+ * header][payload] chunks (lib/raop_rtp_mirror.c), little-endian header. */
+
+/* Real, temporally-varying frame content is loaded at runtime from a .cap
+ * fixture (load_mirror_frames() below) -- a repeated single IDR masks
+ * whether a reconnect visibly resumes rendering (bug doc, 9.3). */
+
+/* Mirrors lib/mirror_buffer.c's AES-CTR key/iv derivation and per-packet
+ * carry state -- CTR encrypt/decrypt are the same XOR-with-keystream op. */
+struct MirrorCrypto {
+    aes_ctx_t *ctx = NULL;
+    int carry_count = 0;
+    unsigned char carry[16] = {0};
+};
+
+void mirror_crypto_init(MirrorCrypto &mc, const unsigned char *aeskey_audio, uint64_t stream_connection_id) {
+    unsigned char aeskey_video[64] = {0}, aesiv_video[64] = {0};
+    snprintf((char *) aeskey_video, sizeof(aeskey_video), "AirPlayStreamKey%llu", (unsigned long long) stream_connection_id);
+    snprintf((char *) aesiv_video, sizeof(aesiv_video), "AirPlayStreamIV%llu", (unsigned long long) stream_connection_id);
+    sha_ctx_t *sha = sha_init();
+    sha_update(sha, aeskey_video, (int) strlen((char *) aeskey_video));
+    sha_update(sha, aeskey_audio, 16);
+    sha_final(sha, aeskey_video, NULL);
+    sha_reset(sha);
+    sha_update(sha, aesiv_video, (int) strlen((char *) aesiv_video));
+    sha_update(sha, aeskey_audio, 16);
+    sha_final(sha, aesiv_video, NULL);
+    sha_destroy(sha);
+    if (mc.ctx) aes_ctr_destroy(mc.ctx);
+    mc.ctx = aes_ctr_init(aeskey_video, aesiv_video);
+    mc.carry_count = 0;
+}
+
+/* In-place AES-CTR, continuing this MirrorCrypto's keystream across calls
+ * -- mirrors mirror_buffer_decrypt()'s block-boundary carry logic. */
+void mirror_crypto_encrypt(MirrorCrypto &mc, unsigned char *data, int len) {
+    if (mc.carry_count > 0) {
+        for (int i = 0; i < mc.carry_count; i++) data[i] ^= mc.carry[(16 - mc.carry_count) + i];
+    }
+    int block_len = ((len - mc.carry_count) / 16) * 16;
+    aes_ctr_start_fresh_block(mc.ctx);
+    aes_ctr_encrypt(mc.ctx, data + mc.carry_count, data + mc.carry_count, block_len);
+    int restlen = (len - mc.carry_count) % 16;
+    int reststart = len - restlen;
+    mc.carry_count = 0;
+    if (restlen > 0) {
+        memset(mc.carry, 0, 16);
+        memcpy(mc.carry, data + reststart, restlen);
+        aes_ctr_encrypt(mc.ctx, mc.carry, mc.carry, 16);
+        memcpy(data + reststart, mc.carry, restlen);
+        mc.carry_count = 16 - restlen;
+    }
+}
+
+/* Raw timestamp raop_rtp_mirror_thread() expects: hi32=seconds, lo32=Q32
+ * fraction. video_process()'s own bootstrap anchors this to wall-clock
+ * time, so any increasing sequence works -- no NTP handshake needed. */
+uint64_t mirror_ntp_raw(uint64_t ns) {
+    uint64_t seconds = ns / 1000000000ULL;
+    uint64_t frac = ((ns % 1000000000ULL) << 32) / 1000000000ULL;
+    return (seconds << 32) | frac;
+}
+
+/* Real per-frame H.264 content for mirrortest: one SPS/PPS pair plus a
+ * genuine, temporally-varying sequence of VCL NALs (start codes
+ * stripped), loaded from a -capture-format .cap fixture. */
+struct MirrorFrames {
+    std::vector<unsigned char> sps;
+    std::vector<unsigned char> pps;
+    std::vector<std::vector<unsigned char>> vcl;
+};
+
+/* Splits Annex-B NALs (each prefixed by a 3- or 4-byte start code) out of
+ * one buffer; returns each NAL's bytes with the start code stripped. */
+std::vector<std::vector<unsigned char>> split_annexb_nals(const unsigned char *data, int len) {
+    std::vector<std::vector<unsigned char>> nals;
+    std::vector<int> starts;
+    for (int i = 0; i + 2 < len; i++) {
+        if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1) starts.push_back(i + 3);
+    }
+    for (size_t i = 0; i < starts.size(); i++) {
+        int begin = starts[i];
+        int end = (i + 1 < starts.size()) ? starts[i + 1] - 3 : len;
+        while (end > begin && data[end - 1] == 0) end--; /* trailing zero before next start code */
+        if (end > begin) nals.emplace_back(data + begin, data + end);
+    }
+    return nals;
+}
+
+/* Reads a -capture-format .cap file's 'V' records (uxplay.cpp's
+ * cap_write()/trim-capture.py's RECORD_HEADER_FMT): record 0 is a real
+ * SPS+PPS+IDR bundle, later records are single real VCL NALs. */
+bool load_mirror_frames(const std::string &path, MirrorFrames &out) {
+    FILE *f = fopen(path.c_str(), "rb");
+    if (!f) {
+        fprintf(stderr, "load_mirror_frames: cannot open %s\n", path.c_str());
+        return false;
+    }
+    std::vector<unsigned char> buf(1 << 21);
+    bool first = true;
+    while (true) {
+        char type; uint64_t mono, ntp; int32_t len;
+        if (fread(&type, 1, 1, f) != 1) break;
+        if (fread(&mono, 8, 1, f) != 1) break;
+        if (fread(&ntp, 8, 1, f) != 1) break;
+        if (fread(&len, 4, 1, f) != 1) break;
+        if (len > 0) {
+            if ((size_t) len > buf.size()) buf.resize(len);
+            if (fread(buf.data(), 1, len, f) != (size_t) len) break;
+        }
+        if (type != 'V' || len <= 0) continue;
+        for (auto &nal : split_annexb_nals(buf.data(), len)) {
+            if (nal.empty()) continue;
+            int nal_type = nal[0] & 0x1F;
+            if (nal_type == 7) { if (first) out.sps = nal; }
+            else if (nal_type == 8) { if (first) out.pps = nal; }
+            else if (nal_type == 1 || nal_type == 5) out.vcl.push_back(std::move(nal));
+        }
+        first = false;
+    }
+    fclose(f);
+    if (out.sps.empty() || out.pps.empty() || out.vcl.empty()) {
+        fprintf(stderr, "load_mirror_frames: %s yielded sps=%zu pps=%zu vcl=%zu, expected all non-empty\n",
+                path.c_str(), out.sps.size(), out.pps.size(), out.vcl.size());
+        return false;
+    }
+    fprintf(stderr, "load_mirror_frames: loaded sps=%zuB pps=%zuB, %zu real VCL frames from %s\n",
+            out.sps.size(), out.pps.size(), out.vcl.size(), path.c_str());
+    return true;
+}
+
+/* Fills the 128-byte mirror-data-socket header; integers are raw
+ * host-order bytes, matching byteutils_get_int()/get_long()'s reads. */
+void build_mirror_header(unsigned char hdr[128], uint32_t payload_size, unsigned char type,
+                          unsigned char opt6, unsigned char opt7, uint64_t ntp_raw) {
+    memset(hdr, 0, 128);
+    memcpy(hdr, &payload_size, 4);
+    hdr[4] = type;
+    hdr[6] = opt6;
+    hdr[7] = opt7;
+    memcpy(hdr + 8, &ntp_raw, 8);
+}
+
+/* Unencrypted SPS+PPS packet (packet[4]=0x01) -- server-side this
+ * triggers video_set_codec(); layout matches raop_rtp_mirror.c case 0x01. */
+bool send_mirror_sps_pps(int fd, uint64_t ntp_ns, const MirrorFrames &mf) {
+    std::vector<unsigned char> payload(6 + 2 + mf.sps.size() + 1 + 2 + mf.pps.size());
+    unsigned char *p = payload.data();
+    p[0] = 1; p[1] = mf.sps[1]; p[2] = mf.sps[2]; p[3] = mf.sps[3];
+    p[4] = 0xff; p[5] = 0xe1;
+    p += 6;
+    unsigned short sps_size = htons((unsigned short) mf.sps.size());
+    memcpy(p, &sps_size, 2); p += 2;
+    memcpy(p, mf.sps.data(), mf.sps.size()); p += mf.sps.size();
+    *p++ = 1; /* number_of_pps */
+    unsigned short pps_size = htons((unsigned short) mf.pps.size());
+    memcpy(p, &pps_size, 2); p += 2;
+    memcpy(p, mf.pps.data(), mf.pps.size()); p += mf.pps.size();
+
+    unsigned char hdr[128];
+    build_mirror_header(hdr, (uint32_t) payload.size(), 0x01, 0x16, 0x01, mirror_ntp_raw(ntp_ns));
+    /* width/height fields: only feed video_report_size() bookkeeping, any
+     * consistent positive size works for exercising the code path. */
+    float w = 1920.0f, h = 1080.0f;
+    memcpy(hdr + 16, &w, 4); memcpy(hdr + 20, &h, 4);
+    memcpy(hdr + 40, &w, 4); memcpy(hdr + 44, &h, 4);
+    memcpy(hdr + 56, &w, 4); memcpy(hdr + 60, &h, 4);
+
+    if (send(fd, hdr, sizeof(hdr), 0) < 0) return false;
+    return send(fd, payload.data(), payload.size(), 0) >= 0;
+}
+
+/* One encrypted VCL NAL (packet[4]=0x00): length-prefixed then AES-CTR
+ * encrypted as a whole, matching mirror_buffer_decrypt()'s expectation. */
+bool send_mirror_video_frame(int fd, MirrorCrypto &mc, uint64_t ntp_ns, const std::vector<unsigned char> &nal) {
+    std::vector<unsigned char> plain(4 + nal.size());
+    uint32_t nal_len_be = htonl((uint32_t) nal.size());
+    memcpy(plain.data(), &nal_len_be, 4);
+    memcpy(plain.data() + 4, nal.data(), nal.size());
+    mirror_crypto_encrypt(mc, plain.data(), (int) plain.size());
+
+    unsigned char hdr[128];
+    build_mirror_header(hdr, (uint32_t) plain.size(), 0x00, 0x00, 0x00, mirror_ntp_raw(ntp_ns));
+    if (send(fd, hdr, sizeof(hdr), 0) < 0) return false;
+    return send(fd, plain.data(), plain.size(), 0) >= 0;
+}
+
+/* SETUP a type=110 mirror stream, same first_setup convention as
+ * do_setup(). Returns the server's mirror TCP dataPort, or 0 on failure. */
+unsigned short do_setup_mirror(int sock, int &cseq, bool first_setup, uint64_t stream_connection_id,
+                                const unsigned char *ekey, const unsigned char *eiv) {
+    plist_t root = plist_new_dict();
+    if (first_setup) {
+        plist_dict_set_item(root, "ekey", plist_new_data((const char *) ekey, 72));
+        plist_dict_set_item(root, "eiv", plist_new_data((const char *) eiv, 16));
+        plist_dict_set_item(root, "deviceID", plist_new_string("11:22:33:44:55:66"));
+        plist_dict_set_item(root, "timingProtocol", plist_new_string("None"));
+        plist_dict_set_item(root, "timingPort", plist_new_uint(0));
+    }
+    plist_t streams = plist_new_array();
+    plist_t stream = plist_new_dict();
+    plist_dict_set_item(stream, "type", plist_new_uint(110));
+    plist_dict_set_item(stream, "streamConnectionID", plist_new_uint(stream_connection_id));
+    plist_array_append_item(streams, stream);
+    plist_dict_set_item(root, "streams", streams);
+    std::vector<unsigned char> body;
+    plist_to_bytes(root, body);
+    plist_free(root);
+
+    std::vector<unsigned char> resp;
+    if (!rtsp_request(sock, "SETUP", "rtsp://127.0.0.1/1", cseq++, body.data(), body.size(), resp)) {
+        return 0;
+    }
+    plist_t resp_plist = NULL;
+    plist_from_bin((const char *) resp.data(), (uint32_t) resp.size(), &resp_plist);
+    uint64_t dport = 0;
+    if (resp_plist) {
+        plist_t rstreams = plist_dict_get_item(resp_plist, "streams");
+        if (rstreams && plist_array_get_size(rstreams) > 0) {
+            plist_t dport_node = plist_dict_get_item(plist_array_get_item(rstreams, 0), "dataPort");
+            if (dport_node) plist_get_uint_val(dport_node, &dport);
+        }
+        plist_free(resp_plist);
+    }
+    return (unsigned short) dport;
+}
+
+/* --- mode: mirrortest ----------------------------------------------------
+ * Real mirror SETUP/video-frames/TEARDOWN cycles on one control connection,
+ * exercising the real httpd-thread/raop_rtp_mirror_thread interleaving. */
+int mode_mirrortest(int cycles, int gap_s, bool no_final_teardown, int idle_s,
+                     const std::string &frames_cap_path, int frames_per_cycle) {
+    MirrorFrames mf;
+    if (!load_mirror_frames(frames_cap_path, mf)) return 1;
+    if (frames_per_cycle <= 0) frames_per_cycle = (int) mf.vcl.size();
+
+    fprintf(stderr, "mirrortest: connecting to %s:%u\n", g_host.c_str(), g_port);
+    int sock = connect_rtsp();
+    if (sock < 0) return 1;
+
+    int cseq = 1;
+    fairplay_t *myfp = NULL;
+    handshake(sock, cseq, &myfp);
+
+    unsigned char ekey[72], eiv[16], aeskey[16];
+    get_random_bytes(ekey, sizeof(ekey));
+    get_random_bytes(eiv, sizeof(eiv));
+    fairplay_decrypt(myfp, ekey, aeskey);
+
+    for (int cycle = 0; cycle < cycles; cycle++) {
+        uint64_t stream_id = 0x1000 + (uint64_t) cycle;
+        fprintf(stderr, "mirrortest: cycle %d SEND-SETUP t=%.6f\n", cycle, now_s());
+        unsigned short dport = do_setup_mirror(sock, cseq, cycle == 0, stream_id, ekey, eiv);
+        fprintf(stderr, "mirrortest: cycle %d RECV-SETUP-response t=%.6f dataPort=%u\n", cycle, now_s(), dport);
+        if (!dport) {
+            fprintf(stderr, "mirrortest: cycle %d got no mirror dataPort, aborting\n", cycle);
+            break;
+        }
+
+        int vfd = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in vdest;
+        memset(&vdest, 0, sizeof(vdest));
+        vdest.sin_family = AF_INET;
+        vdest.sin_port = htons(dport);
+        vdest.sin_addr.s_addr = inet_addr(g_host.c_str());
+        if (connect(vfd, (struct sockaddr *) &vdest, sizeof(vdest)) < 0) {
+            fprintf(stderr, "mirrortest: cycle %d connect to mirror dataPort %u failed: %s\n",
+                    cycle, dport, strerror(errno));
+            close(vfd);
+            break;
+        }
+        fprintf(stderr, "mirrortest: cycle %d CONNECTED-MIRROR-TCP t=%.6f\n", cycle, now_s());
+
+        MirrorCrypto mc;
+        mirror_crypto_init(mc, aeskey, stream_id);
+        uint64_t ntp_ns = (uint64_t) cycle * 10000000000ULL; /* keep cycles' timelines apart */
+        send_mirror_sps_pps(vfd, ntp_ns, mf);
+        fprintf(stderr, "mirrortest: cycle %d SENT-SPS-PPS t=%.6f\n", cycle, now_s());
+        /* Frame 0 must reuse ntp_ns unchanged (SPS/PPS only prepends on an
+         * exact timestamp match). Each cycle restarts from mf.vcl[0] (a
+         * real IDR), so wrapping past the fixture's length is legal. */
+        for (int f = 0; f < frames_per_cycle; f++) {
+            send_mirror_video_frame(vfd, mc, ntp_ns, mf.vcl[f % mf.vcl.size()]);
+            usleep(33000);
+            ntp_ns += 33366667; /* ~30fps spacing for the next frame */
+        }
+        fprintf(stderr, "mirrortest: cycle %d SENT-%d-FRAMES t=%.6f\n", cycle, frames_per_cycle, now_s());
+        aes_ctr_destroy(mc.ctx);
+        close(vfd);
+
+        /* --no-teardown: leave the connection open, no TEARDOWN/feedback
+         * -- reproduces a vanished client for the implicit-disconnect path. */
+        if (no_final_teardown && cycle == cycles - 1) {
+            fprintf(stderr, "mirrortest: cycle %d NO-TEARDOWN, going idle t=%.6f\n", cycle, now_s());
+            break;
+        }
+
+        fprintf(stderr, "mirrortest: cycle %d SEND-TEARDOWN t=%.6f\n", cycle, now_s());
+        teardown(sock, cseq, 110);
+        fprintf(stderr, "mirrortest: cycle %d RECV-TEARDOWN-response t=%.6f\n", cycle, now_s());
+
+        /* Same /feedback keepalive pattern as mode_threadtest(), so a
+         * --gap-s longer than the server's missed-feedback timeout doesn't
+         * get the control connection killed between cycles. */
+        for (int waited = 0; waited < gap_s; waited += 2) {
+            int chunk = (gap_s - waited) < 2 ? (gap_s - waited) : 2;
+            sleep((unsigned) chunk);
+            if (waited + chunk < gap_s) {
+                std::vector<unsigned char> fb_resp;
+                rtsp_request(sock, "POST", "/feedback", cseq++, NULL, 0, fb_resp);
+            }
+        }
+    }
+
+    if (no_final_teardown && idle_s > 0) {
+        fprintf(stderr, "mirrortest: idling %ds with no feedback (no-teardown)\n", idle_s);
+        sleep((unsigned) idle_s);
+    }
+
+    fairplay_destroy(myfp);
+    close(sock);
+    fprintf(stderr, "mirrortest: done (%d cycles)\n", cycles);
+    return 0;
 }
 
 /* --- mode: threadtest --------------------------------------------------
@@ -622,6 +953,18 @@ void print_usage(const char *argv0) {
         "usage: %s <mode> --port <raop_port> [--host <ip>] [mode-specific args]\n"
         "modes:\n"
         "  threadtest [N] [--gap-s S]   N SETUP/audio/TEARDOWN cycles (default 8)\n"
+        "  mirrortest [N] [--gap-s S] [--no-teardown] [--idle-s S]\n"
+        "             [--frames-cap PATH] [--frames-per-cycle N]\n"
+        "                                N mirror SETUP/video-frames/TEARDOWN cycles (default 8)\n"
+        "                                --no-teardown: last cycle sends no TEARDOWN/feedback\n"
+        "                                (vanished-client / implicit-disconnect repro); --idle-s\n"
+        "                                then sleeps that long before exiting (default 0)\n"
+        "                                --frames-cap: a -capture-format .cap fixture to source\n"
+        "                                real SPS/PPS + a genuine varying frame sequence from\n"
+        "                                (default tools/captures/trimmed/personalmac-stall-20260911-10s.cap)\n"
+        "                                --frames-per-cycle: real frames sent per cycle at ~30fps\n"
+        "                                spacing, wrapping if it exceeds the fixture's own frame\n"
+        "                                count (default 90, ~3s; 0 = the fixture's full length)\n"
         "  ntpresync                    NTP-sync-reset-on-restart regression check\n"
         "  resendstorm                  resend-request-rate regression check\n"
         "  resendrecovery               end-to-end resend recovery-time model\n"
@@ -631,6 +974,9 @@ void print_usage(const char *argv0) {
 } // namespace
 
 int main(int argc, char *argv[]) {
+    /* A server-side disconnect (TEARDOWN race, decode error) must fail a
+     * send() with EPIPE, not kill this process outright. */
+    signal(SIGPIPE, SIG_IGN);
     if (argc < 2) {
         print_usage(argv[0]);
         return 1;
@@ -638,6 +984,10 @@ int main(int argc, char *argv[]) {
     std::string mode = argv[1];
     int cycles = 8;
     int gap_s = 0;
+    bool no_final_teardown = false;
+    int idle_s = 0;
+    std::string frames_cap_path = "tools/captures/trimmed/personalmac-stall-20260911-10s.cap";
+    int frames_per_cycle = 90;
     for (int i = 2; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--port" && i + 1 < argc) {
@@ -646,7 +996,15 @@ int main(int argc, char *argv[]) {
             g_host = argv[++i];
         } else if (arg == "--gap-s" && i + 1 < argc) {
             gap_s = atoi(argv[++i]);
-        } else if (mode == "threadtest" && arg[0] != '-') {
+        } else if (arg == "--no-teardown") {
+            no_final_teardown = true;
+        } else if (arg == "--idle-s" && i + 1 < argc) {
+            idle_s = atoi(argv[++i]);
+        } else if (arg == "--frames-cap" && i + 1 < argc) {
+            frames_cap_path = argv[++i];
+        } else if (arg == "--frames-per-cycle" && i + 1 < argc) {
+            frames_per_cycle = atoi(argv[++i]);
+        } else if ((mode == "threadtest" || mode == "mirrortest") && arg[0] != '-') {
             cycles = atoi(argv[i]);
         } else {
             fprintf(stderr, "synthetic-client: unrecognized argument '%s'\n", arg.c_str());
@@ -661,6 +1019,7 @@ int main(int argc, char *argv[]) {
     }
 
     if (mode == "threadtest") return mode_threadtest(cycles, gap_s);
+    if (mode == "mirrortest") return mode_mirrortest(cycles, gap_s, no_final_teardown, idle_s, frames_cap_path, frames_per_cycle);
     if (mode == "ntpresync") return mode_ntpresync();
     if (mode == "resendstorm") return mode_resendstorm();
     if (mode == "resendrecovery") return mode_resendrecovery();
