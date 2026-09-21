@@ -1412,10 +1412,10 @@ int video_renderer_choose_codec (bool video_is_jpeg, bool video_is_h265) {
      * Unconditional and idempotent: harmless on a same-codec re-confirm. */
     g_atomic_int_inc(&video_connect_epoch);
     apply_render_rectangle(cached_overscan_rect, FALSE);
+    video_renderer_blank_primary_plane(); /* (re)confirmed PLAYING: clear any stale primary-plane content */
     if (renderer_used == renderer) {
         return 0; /* was already the active renderer (now re-confirmed PLAYING) */
     }
-    video_renderer_blank_primary_plane(); /* new connection: clear any stale primary-plane content */
     logger_log(logger, LOGGER_DEBUG, "video_pipeline state change from %s to %s\n",
                gst_element_state_get_name (old_state),gst_element_state_get_name (new_state));
     if (strstr(renderer_used->codec, h265)) {
