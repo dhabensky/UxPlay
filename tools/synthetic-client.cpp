@@ -948,6 +948,220 @@ int mode_resendrecovery() {
     return 0;
 }
 
+/* --- mode: peekstall -- a connection that sends fewer than 8 bytes then
+ * goes silent must not delay a second, unrelated connection's request
+ * behind it (lib/httpd.c head-of-line-blocking regression check). */
+int mode_peekstall() {
+    int stall_sock = connect_rtsp();
+    if (stall_sock < 0) {
+        fprintf(stderr, "PEEKSTALL: FAIL (stall connect failed)\n");
+        return 1;
+    }
+    /* Fewer than the 8 bytes httpd_thread() peeks at before it knows this
+     * isn't a reverse-HTTP response -- then this connection goes silent. */
+    const char partial[] = "OPTI";
+    if (send(stall_sock, partial, sizeof(partial) - 1, 0) < 0) {
+        fprintf(stderr, "PEEKSTALL: FAIL (partial send failed: %s)\n", strerror(errno));
+        return 1;
+    }
+    /* Long enough for the server to accept+see the partial bytes, short
+     * enough to land inside any retry-loop window a regressed server
+     * might be captive in, so the probe actually queues up behind it. */
+    usleep(20000);
+
+    int probe_sock = connect_rtsp();
+    if (probe_sock < 0) {
+        fprintf(stderr, "PEEKSTALL: FAIL (probe connect failed)\n");
+        return 1;
+    }
+    /* Bounds this test's own runtime against a server that never responds
+     * at all (the original, unpatched bug) instead of hanging forever. */
+    struct timeval tv;
+    tv.tv_sec = 3; tv.tv_usec = 0;
+    setsockopt(probe_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    int cseq = 1;
+    std::vector<unsigned char> resp;
+    double t0 = now_s();
+    fprintf(stderr, "PEEKSTALL: SENT-PROBE t=%.6f\n", t0);
+    bool ok = rtsp_request(probe_sock, "GET", "/info", cseq, NULL, 0, resp);
+    double t1 = now_s();
+    fprintf(stderr, "PEEKSTALL: RECV-PROBE t=%.6f elapsed=%.6f ok=%d\n", t1, t1 - t0, ok ? 1 : 0);
+
+    close(probe_sock);
+    close(stall_sock);
+    if (!ok) {
+        fprintf(stderr, "PEEKSTALL: FAIL (probe request never got a response within %lds)\n", (long) tv.tv_sec);
+        return 1;
+    }
+    fprintf(stderr, "PEEKSTALL: done\n");
+    return 0;
+}
+
+/* --- mode: shorturl -- a request line completing within the first 8 peeked
+ * bytes (e.g. a 1-char URL) must not corrupt the parsed protocol string by
+ * reading past those bytes (lib/httpd.c peek-truncation regression check). */
+int mode_shorturl() {
+    int sock = connect_rtsp();
+    if (sock < 0) {
+        fprintf(stderr, "SHORTURL: FAIL (connect failed)\n");
+        return 1;
+    }
+    const char req[] = "GET / RTSP/1.0\r\nCSeq: 1\r\n\r\n";
+    if (send(sock, req, sizeof(req) - 1, 0) < 0) {
+        fprintf(stderr, "SHORTURL: FAIL (send failed: %s)\n", strerror(errno));
+        close(sock);
+        return 1;
+    }
+    struct timeval tv;
+    tv.tv_sec = 3; tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    char resp[128] = {0};
+    ssize_t n = recv(sock, resp, sizeof(resp) - 1, 0);
+    close(sock);
+    if (n <= 0) {
+        fprintf(stderr, "SHORTURL: FAIL (no response: %s)\n", strerror(errno));
+        return 1;
+    }
+    bool ok = (n >= 9 && !memcmp(resp, "RTSP/1.0 ", 9));
+    fprintf(stderr, "SHORTURL: recv_len=%zd ok=%d\n", n, ok ? 1 : 0);
+    if (!ok) {
+        fprintf(stderr, "SHORTURL: FAIL (corrupted status line, first bytes:");
+        for (ssize_t k = 0; k < (n < 16 ? n : 16); k++) fprintf(stderr, " %02x", (unsigned char) resp[k]);
+        fprintf(stderr, ")\n");
+        return 1;
+    }
+    fprintf(stderr, "SHORTURL: done\n");
+    return 0;
+}
+
+/* --- mode: shorturlfrag -- same corruption class as `shorturl`, but the
+ * request line arrives split across two send() calls with a real gap, so
+ * the server's first recv() genuinely returns fewer than 8 bytes and takes
+ * the peek-continuation path instead of the whole-packet path (lib/httpd.c
+ * regression check). Runs `iters` independent connections since the
+ * original bug was nondeterministic (stale-stack-memory disclosure). */
+int mode_shorturlfrag(int iters) {
+    int failures = 0;
+    for (int i = 0; i < iters; i++) {
+        int sock = connect_rtsp();
+        if (sock < 0) {
+            fprintf(stderr, "SHORTURLFRAG[%d]: FAIL (connect failed)\n", i);
+            failures++;
+            continue;
+        }
+        const char part1[] = "GET ";
+        const char part2[] = "/ RTSP/1.0\r\nCSeq: 1\r\n\r\n";
+        if (send(sock, part1, sizeof(part1) - 1, 0) < 0) {
+            fprintf(stderr, "SHORTURLFRAG[%d]: FAIL (part1 send failed: %s)\n", i, strerror(errno));
+            close(sock);
+            failures++;
+            continue;
+        }
+        /* Long enough that the server's first recv() genuinely returns only
+         * part1, forcing the peek_len > 0 continuation path. */
+        usleep(300000);
+        if (send(sock, part2, sizeof(part2) - 1, 0) < 0) {
+            fprintf(stderr, "SHORTURLFRAG[%d]: FAIL (part2 send failed: %s)\n", i, strerror(errno));
+            close(sock);
+            failures++;
+            continue;
+        }
+        struct timeval tv;
+        tv.tv_sec = 3; tv.tv_usec = 0;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        char resp[128] = {0};
+        ssize_t n = recv(sock, resp, sizeof(resp) - 1, 0);
+        close(sock);
+        if (n <= 0) {
+            fprintf(stderr, "SHORTURLFRAG[%d]: FAIL (no response: %s)\n", i, strerror(errno));
+            failures++;
+            continue;
+        }
+        bool ok = (n >= 9 && !memcmp(resp, "RTSP/1.0 ", 9));
+        fprintf(stderr, "SHORTURLFRAG[%d]: recv_len=%zd ok=%d\n", i, n, ok ? 1 : 0);
+        if (!ok) {
+            fprintf(stderr, "SHORTURLFRAG[%d]: FAIL (corrupted status line, first bytes:", i);
+            for (ssize_t k = 0; k < (n < 16 ? n : 16); k++) fprintf(stderr, " %02x", (unsigned char) resp[k]);
+            fprintf(stderr, ")\n");
+            failures++;
+        }
+    }
+    fprintf(stderr, "SHORTURLFRAG: done total=%d failures=%d\n", iters, failures);
+    return failures ? 1 : 0;
+}
+
+/* --- mode: shorturlsweep -- splits "GET / RTSP/1.0..." at a caller-chosen
+ * byte offset; the response's protocol field must be an exact prefix of
+ * "RTSP/1.0", never leaked memory past it. Prints raw response bytes. */
+int mode_shorturlsweep(int splitbytes, int iters) {
+    static const char full[] = "GET / RTSP/1.0\r\nCSeq: 1\r\n\r\n";
+    const int fulllen = (int) sizeof(full) - 1;
+    const int proto_start = 6; /* index of 'R' in full: "GET / " is 6 bytes */
+    if (splitbytes < 1 || splitbytes >= fulllen) {
+        fprintf(stderr, "SHORTURLSWEEP: FAIL (splitbytes %d out of range [1,%d))\n", splitbytes, fulllen);
+        return 1;
+    }
+    int avail = splitbytes - proto_start;
+    if (avail < 0) avail = 0;
+    if (avail > 8) avail = 8;
+    char expected[10] = {0};
+    memcpy(expected, full + proto_start, (size_t) avail);
+    strcat(expected, " ");
+    int failures = 0;
+    for (int i = 0; i < iters; i++) {
+        int sock = connect_rtsp();
+        if (sock < 0) {
+            fprintf(stderr, "SHORTURLSWEEP[split=%d,iter=%d]: FAIL (connect failed)\n", splitbytes, i);
+            failures++;
+            continue;
+        }
+        if (send(sock, full, splitbytes, 0) < 0) {
+            fprintf(stderr, "SHORTURLSWEEP[split=%d,iter=%d]: FAIL (part1 send failed: %s)\n", splitbytes, i, strerror(errno));
+            close(sock);
+            failures++;
+            continue;
+        }
+        /* Long enough that the server's recv() genuinely returns only the
+         * first part, matching the reviewer's repro timing. */
+        usleep(150000);
+        if (send(sock, full + splitbytes, fulllen - splitbytes, 0) < 0) {
+            fprintf(stderr, "SHORTURLSWEEP[split=%d,iter=%d]: FAIL (part2 send failed: %s)\n", splitbytes, i, strerror(errno));
+            close(sock);
+            failures++;
+            continue;
+        }
+        struct timeval tv;
+        tv.tv_sec = 3; tv.tv_usec = 0;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        char resp[256] = {0};
+        ssize_t n = recv(sock, resp, sizeof(resp) - 1, 0);
+        close(sock);
+        if (n <= 0) {
+            fprintf(stderr, "SHORTURLSWEEP[split=%d,iter=%d]: FAIL (no response: %s)\n", splitbytes, i, strerror(errno));
+            failures++;
+            continue;
+        }
+        size_t explen = strlen(expected);
+        bool ok = (n >= (ssize_t) explen && !memcmp(resp, expected, explen));
+        fprintf(stderr, "SHORTURLSWEEP[split=%d,iter=%d]: recv_len=%zd ok=%d expected_prefix=\"%s\" bytes:",
+                splitbytes, i, n, ok ? 1 : 0, expected);
+        for (ssize_t k = 0; k < n; k++) fprintf(stderr, " %02x", (unsigned char) resp[k]);
+        fprintf(stderr, "  ascii=\"");
+        for (ssize_t k = 0; k < n; k++) {
+            unsigned char c = (unsigned char) resp[k];
+            fputc((c >= 0x20 && c < 0x7f) ? c : '.', stderr);
+        }
+        fprintf(stderr, "\"\n");
+        if (!ok) failures++;
+    }
+    fprintf(stderr, "SHORTURLSWEEP[split=%d]: done total=%d failures=%d\n", splitbytes, iters, failures);
+    return failures ? 1 : 0;
+}
+
 void print_usage(const char *argv0) {
     fprintf(stderr,
         "usage: %s <mode> --port <raop_port> [--host <ip>] [mode-specific args]\n"
@@ -968,6 +1182,11 @@ void print_usage(const char *argv0) {
         "  ntpresync                    NTP-sync-reset-on-restart regression check\n"
         "  resendstorm                  resend-request-rate regression check\n"
         "  resendrecovery               end-to-end resend recovery-time model\n"
+        "  peekstall                    httpd.c head-of-line-blocking regression check\n"
+        "  shorturl                     httpd.c peek-truncation/protocol-corruption regression check\n"
+        "  shorturlfrag [N]              httpd.c peek-continuation-path corruption check (default 5 iters)\n"
+        "  shorturlsweep <split> [N]     split \"GET / RTSP/1.0...\" at <split> bytes, N iters (default 5),\n"
+        "                                prints raw response bytes each run\n"
         "--host defaults to 127.0.0.1.\n", argv0);
 }
 
@@ -988,6 +1207,10 @@ int main(int argc, char *argv[]) {
     int idle_s = 0;
     std::string frames_cap_path = "tools/captures/trimmed/personalmac-stall-20260911-10s.cap";
     int frames_per_cycle = 90;
+    int frag_iters = 5;
+    int sweep_split = -1;
+    int sweep_iters = 5;
+    int sweep_positional_seen = 0;
     for (int i = 2; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--port" && i + 1 < argc) {
@@ -1006,6 +1229,15 @@ int main(int argc, char *argv[]) {
             frames_per_cycle = atoi(argv[++i]);
         } else if ((mode == "threadtest" || mode == "mirrortest") && arg[0] != '-') {
             cycles = atoi(argv[i]);
+        } else if (mode == "shorturlfrag" && arg[0] != '-') {
+            frag_iters = atoi(argv[i]);
+        } else if (mode == "shorturlsweep" && arg[0] != '-') {
+            if (sweep_positional_seen == 0) {
+                sweep_split = atoi(argv[i]);
+            } else {
+                sweep_iters = atoi(argv[i]);
+            }
+            sweep_positional_seen++;
         } else {
             fprintf(stderr, "synthetic-client: unrecognized argument '%s'\n", arg.c_str());
             print_usage(argv[0]);
@@ -1023,6 +1255,17 @@ int main(int argc, char *argv[]) {
     if (mode == "ntpresync") return mode_ntpresync();
     if (mode == "resendstorm") return mode_resendstorm();
     if (mode == "resendrecovery") return mode_resendrecovery();
+    if (mode == "peekstall") return mode_peekstall();
+    if (mode == "shorturl") return mode_shorturl();
+    if (mode == "shorturlfrag") return mode_shorturlfrag(frag_iters);
+    if (mode == "shorturlsweep") {
+        if (sweep_split < 0) {
+            fprintf(stderr, "synthetic-client: shorturlsweep requires a <split> byte count\n");
+            print_usage(argv[0]);
+            return 1;
+        }
+        return mode_shorturlsweep(sweep_split, sweep_iters);
+    }
 
     fprintf(stderr, "synthetic-client: unknown mode '%s'\n", mode.c_str());
     print_usage(argv[0]);
