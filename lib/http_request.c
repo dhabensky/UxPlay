@@ -40,6 +40,10 @@ struct http_request_s {
     int datalen;
 
     int complete;
+
+    /* one-past-the-end of the buffer passed to the current
+     * http_request_add_data() call; bounds on_url()'s post-URL peek */
+    const char *feed_end;
 };
 
 static int
@@ -54,7 +58,13 @@ on_url(llhttp_t *parser, const char *at, size_t length)
     request->url[urllen] = '\0';
     strncat(request->url, at, length);
 
-    strncpy(request->protocol, at + length + 1, 8);
+    /* Bytes after the URL delimiter are only valid up to feed_end -- this
+     * call's fed buffer, not whatever stale bytes follow it on the stack. */
+    const char *proto_start = at + length + 1;
+    ptrdiff_t avail = request->feed_end - proto_start;
+    if (avail > 0) {
+        memcpy(request->protocol, proto_start, (size_t)(avail < 8 ? avail : 8));
+    }
 
     return 0;
 }
@@ -182,6 +192,7 @@ http_request_add_data(http_request_t *request, const char *data, int datalen)
 {
     assert(request);
 
+    request->feed_end = data + datalen;
     int ret = llhttp_execute(&request->parser, data, datalen);
 
     /* support for "Upgrade" to reverse http ("PTTH/1.0") protocol */
