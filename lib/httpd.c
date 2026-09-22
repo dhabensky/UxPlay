@@ -29,6 +29,21 @@
 #include "logger.h"
 #include "utils.h"
 
+#ifdef _WIN32
+#define CAST (char *)
+#else
+#define CAST
+#endif
+
+/* Retry budget for the 8-byte reverse-HTTP peek in httpd_thread(), reset on
+ * any forward progress (see httpd_thread()). */
+#define HTTPD_PEEK_MAX_RETRIES 40
+
+/* Shared capacity for httpd_thread()'s local `buffer` and each connection's
+ * peek_buf accumulator, so a fragmented peek can never be truncated below
+ * what a whole-packet read would have received. */
+#define HTTPD_BUFFER_SIZE 1024
+
 static const char *typename[] = {
     [CONNECTION_TYPE_UNKNOWN] = "Unknown",
     [CONNECTION_TYPE_RAOP]    = "RAOP",
@@ -44,6 +59,9 @@ struct http_connection_s {
     connection_type_t type;
     http_request_t *request;
     int pending_remove;
+    char peek_buf[HTTPD_BUFFER_SIZE]; /* bytes accumulated for the request so far */
+    int peek_len;             /* true byte count accumulated in peek_buf */
+    int peek_retries_left;    /* EAGAIN/timeout budget for the peek */
 };
 typedef struct http_connection_s http_connection_t;
 
@@ -300,6 +318,15 @@ httpd_accept_connection(httpd_t *httpd, int server_fd, int is_ipv6)
         return -1;
     }
 
+    /* Bounds every recv() below (this is a blocking socket) so a client that
+     * sends a few bytes then goes silent can't block httpd_thread()'s single
+     * serial loop -- which would stall every other connection -- forever. */
+    struct timeval recv_tv = { 0, 5000 };
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, CAST &recv_tv, sizeof(recv_tv)) < 0) {
+        logger_log(httpd->logger, LOGGER_ERR, "httpd: could not set client socket timeout %d %s",
+                   SOCKET_GET_ERROR(), SOCKET_ERROR_STRING(SOCKET_GET_ERROR()));
+    }
+
     local_saddrlen = sizeof(local_saddr);
     ret = getsockname(fd, (struct sockaddr *)&local_saddr, &local_saddrlen);
     if (ret == -1) {
@@ -362,7 +389,7 @@ httpd_thread(void *arg)
     httpd_t *httpd = arg;
     char http[] = "HTTP/1.1";
     char event[] = "EVENT/1.0";
-    char buffer[1024];
+    char buffer[HTTPD_BUFFER_SIZE];
 
     bool logger_debug = (logger_get_level(httpd->logger) >= LOGGER_DEBUG);
     assert(httpd);
@@ -449,7 +476,6 @@ httpd_thread(void *arg)
         }
         for (int i = 0; i < httpd->max_connections; i++) {
             int recv_datalen = 0;
-            int new_request = 0;
             http_connection_t *connection = &httpd->connections[i];
 
             if (!connection->connected) {
@@ -463,14 +489,13 @@ httpd_thread(void *arg)
             if (!connection->request) {
                 connection->request = http_request_init();
                 assert(connection->request);
-                new_request = 1;
+                connection->peek_len = 0;
+                connection->peek_retries_left = HTTPD_PEEK_MAX_RETRIES;
                 if (connection->type == CONNECTION_TYPE_PTTH) {
                     http_request_is_reverse(connection->request);
                 }
                 logger_log(httpd->logger, LOGGER_DEBUG, "new request, connection %d, socket %d type %s",
                            i, connection->socket_fd, typename [connection->type]);
-            } else {
-                new_request = 0;
             }
 
             logger_log(httpd->logger, LOGGER_DEBUG, "httpd receiving on socket %d, connection %d",
@@ -495,34 +520,41 @@ httpd_thread(void *arg)
             }
             /* reverse-http responses from the client must not be sent to the llhttp parser:
              * such messages start with "HTTP/1.1" (or sometimes with "EVENT/1.0")  */
-            if (new_request) {
-                int readstart = 0;
-                new_request = 0;
-                while (readstart < 8) {
-                    int ret = recv(connection->socket_fd, buffer + readstart, sizeof(buffer) - readstart, 0);
-                    if (ret == 0) {
-                        logger_log(httpd->logger, LOGGER_DEBUG, "client closed connection on socket %d",
-                                   connection->socket_fd);
-                        httpd_remove_connection(httpd, connection, 0);
-                        break;
-                    } else if (ret == -1) {
-                        if (errno == SOCKET_ERRORNAME(EAGAIN) || errno == SOCKET_ERRORNAME(EWOULDBLOCK) || errno == SOCKET_ERRORNAME(EINTR)) {
-                            continue;
-                        } else {
-                            httpd_remove_connection(httpd, connection, SOCKET_GET_ERROR());
-                            break;
-                        }
+            if (connection->peek_len < 8) {
+                /* One recv() attempt per select() pass, not a captive retry loop:
+                 * a stalled peer no longer delays every other ready connection
+                 * behind it. SO_RCVTIMEO still bounds a single blocking call.
+                 * Always accumulate into peek_buf, whether this is the first
+                 * recv() for the request or a resumed fragmented peek, so
+                 * recv_datalen below is always the true byte count -- never a
+                 * hardcoded 8 -- regardless of how many passes it took. */
+                int ret = recv(connection->socket_fd, connection->peek_buf + connection->peek_len,
+                                sizeof(connection->peek_buf) - connection->peek_len, 0);
+                if (ret == 0) {
+                    logger_log(httpd->logger, LOGGER_DEBUG, "client closed connection on socket %d",
+                               connection->socket_fd);
+                    httpd_remove_connection(httpd, connection, 0);
+                    continue;
+                } else if (ret == -1) {
+                    if ((errno == SOCKET_ERRORNAME(EAGAIN) || errno == SOCKET_ERRORNAME(EWOULDBLOCK) || errno == SOCKET_ERRORNAME(EINTR))
+                        && --connection->peek_retries_left > 0) {
+                        continue;
                     } else {
-                        readstart += ret;
-                        recv_datalen = readstart;
+                        logger_log(httpd->logger, LOGGER_WARNING,
+                                   "httpd: incomplete request on socket %d, giving up", connection->socket_fd);
+                        httpd_remove_connection(httpd, connection, SOCKET_GET_ERROR());
+                        continue;
                     }
                 }
-                if (connection->socket_fd == -1) {
-                    /* connection was removed */
+                connection->peek_retries_left = HTTPD_PEEK_MAX_RETRIES;
+                connection->peek_len += ret;
+                if (connection->peek_len < 8) {
                     continue;
                 }
+                memcpy(buffer, connection->peek_buf, connection->peek_len);
+                recv_datalen = connection->peek_len;
                 if (!memcmp(buffer, http, 8) || !memcmp(buffer, event, 8)) {
-                    http_request_set_reverse(connection->request);  
+                    http_request_set_reverse(connection->request);
                 }
             } else {
                 int ret = recv(connection->socket_fd, buffer, sizeof(buffer), 0);
