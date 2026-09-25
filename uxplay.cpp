@@ -37,6 +37,7 @@
 #include <inttypes.h>
 
 #ifdef _WIN32  /*modifications for Windows compilation */
+#include <cerrno>
 #include <glib.h>
 #include <unordered_map>
 #include <winsock2.h>
@@ -71,6 +72,7 @@
 #include "renderers/video_renderer.h"
 #include "renderers/audio_renderer.h"
 #include "renderers/mux_renderer.h"
+#include "event_fifo.h"
 #ifdef DBUS
 #include <dbus/dbus.h>
 #endif
@@ -133,6 +135,8 @@ static bool skip_video_rebuild = false;
 static int overscan_left = 0, overscan_right = 0, overscan_top = 0, overscan_bottom = 0;
 static std::string overscan_fifo_path;
 static GIOChannel *overscan_fifo_channel = NULL;
+/* Outgoing session-event channel (-efifo); see event_fifo.h. */
+static std::string event_fifo_path;
 static std::string video_parser = "h264parse";
 static std::string video_decoder = "decodebin";
 static std::string video_converter = "videoconvert";
@@ -742,6 +746,7 @@ static gboolean feedback_callback(gpointer loop) {
             LOGI("   Interval since last client feedback request exceeds limit of %u seconds", missed_feedback_limit);
             LOGI("   Sometimes the network connection may recover after a longer delay:\n"
                  "   the default limit n = %d seconds, can be changed with the \"-reset n\" option", MISSED_FEEDBACK_LIMIT);
+            event_fifo_session_end();
             if (!nofreeze) {
                 close_window = false; /* leave "frozen" window open if reset_video is false */
             }
@@ -1276,6 +1281,8 @@ static void print_info (char *name) {
     printf("-overscan l:r:t:b  Compensate for a display cropping the picture's\n");
     printf("          edges; margins in pixels, default 0:0:0:0 (none)\n");
     printf("-ofifo fn Read \"l r t b\\n\" lines from FIFO fn for a live overscan update\n");
+    printf("-efifo fn Write \"session-begin\\n\"/\"session-end\\n\" lines to FIFO fn as\n");
+    printf("          mirroring starts and stops (non-blocking, dropped if unread)\n");
     printf("-fs       Full-screen (only with X11, Wayland, VAAPI, D3D11/12, kms)\n");
     printf("-p        Use legacy ports UDP 6000:6001:7011 TCP 7000:7001:7100\n");
     printf("-p n      Use TCP and UDP ports n,n+1,n+2. range %d-%d\n", LOWEST_ALLOWED_PORT, HIGHEST_PORT);
@@ -2105,6 +2112,12 @@ static void parse_arguments (int argc, char *argv[]) {
                 exit(1);
             }
             overscan_fifo_path = argv[++i];
+        } else if (arg == "-efifo") {
+            if (i == argc - 1) {
+                fprintf(stderr, "invalid \"-efifo\": expected a file path\n");
+                exit(1);
+            }
+            event_fifo_path = argv[++i];
         } else if (arg == "-norenderhealth") {
             render_health_check = false;
         } else {
@@ -2516,6 +2529,7 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
         preserve_connections = true;
     case RESET_TYPE_RTP_SHUTDOWN:
         LOGD("video_reset: type = RTP_Shutdown");
+        event_fifo_session_end();
         if (use_video) {
             if (!hls_support && !preserve_connections) {
                 /* Leave the pipeline running instead of destroy()+init():
@@ -2555,6 +2569,9 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
 }
 
 extern "C" int video_set_codec(void *cls, video_codec_t codec) {
+    /* First mirror codec-config packet: the connection is now streaming
+     * video. Runs at most once per connection, so a drop is never re-emitted. */
+    event_fifo_session_begin();
     bool video_is_h265 = (codec == VIDEO_CODEC_H265);
     if (mux_to_file) {
         mux_renderer_choose_video_codec(video_is_h265);
@@ -2634,6 +2651,7 @@ extern "C" void conn_reset (void *cls, int reason) {
     switch (reason) {
     case 1:
         LOGI("*** ERROR lost connection with client (network problem?)");
+        event_fifo_session_end();
 	break;
     case 2:
         LOGI("*** ERROR Unsupported HLS streaming source: (exit attempt to stream)");
@@ -3642,6 +3660,11 @@ int main (int argc, char *argv[]) {
         stop_dnssd();
         cleanup();
     }
+    /* Process lifetime, not per-client: a consumer attaches once and sees
+     * every session transition. */
+    if (!event_fifo_path.empty() && event_fifo_open(render_logger, event_fifo_path.c_str()) < 0) {
+        LOGE("could not open event fifo %s: %s", event_fifo_path.c_str(), strerror(errno));
+    }
     reconnect:
     compression_type = 0;
     close_window = new_window_closing_behavior;
@@ -3685,6 +3708,11 @@ int main (int argc, char *argv[]) {
 }
  
 static void cleanup() {
+    /* A restart mid-session must not leave the consumer's last event at
+     * "session-begin" forever; a no-op if no session is open. Taking
+     * event_mutex in signal context is no worse than logger_destroy() below. */
+    event_fifo_session_end();
+    event_fifo_close();
     if (mux_to_file) {
         /* Without this, exit(0) kills the pipeline before EOS reaches
          * mp4mux, and the moov atom never gets written. */

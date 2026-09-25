@@ -484,7 +484,8 @@ unsigned short do_setup_mirror(int sock, int &cseq, bool first_setup, uint64_t s
  * Real mirror SETUP/video-frames/TEARDOWN cycles on one control connection,
  * exercising the real httpd-thread/raop_rtp_mirror_thread interleaving. */
 int mode_mirrortest(int cycles, int gap_s, bool no_final_teardown, int idle_s,
-                     const std::string &frames_cap_path, int frames_per_cycle) {
+                     const std::string &frames_cap_path, int frames_per_cycle,
+                     bool abort_mirror) {
     MirrorFrames mf;
     if (!load_mirror_frames(frames_cap_path, mf)) return 1;
     if (frames_per_cycle <= 0) frames_per_cycle = (int) mf.vcl.size();
@@ -541,6 +542,13 @@ int mode_mirrortest(int cycles, int gap_s, bool no_final_teardown, int idle_s,
         }
         fprintf(stderr, "mirrortest: cycle %d SENT-%d-FRAMES t=%.6f\n", cycle, frames_per_cycle, now_s());
         aes_ctr_destroy(mc.ctx);
+        if (abort_mirror) {
+            /* Close with RST instead of FIN, so the server's mirror read
+             * fails with ECONNRESET -- its conn_reset(reason 1) path. */
+            struct linger lg = { 1, 0 };
+            setsockopt(vfd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+            fprintf(stderr, "mirrortest: cycle %d ABORT-MIRROR-TCP t=%.6f\n", cycle, now_s());
+        }
         close(vfd);
 
         /* --no-teardown: leave the connection open, no TEARDOWN/feedback
@@ -1168,7 +1176,7 @@ void print_usage(const char *argv0) {
         "modes:\n"
         "  threadtest [N] [--gap-s S]   N SETUP/audio/TEARDOWN cycles (default 8)\n"
         "  mirrortest [N] [--gap-s S] [--no-teardown] [--idle-s S]\n"
-        "             [--frames-cap PATH] [--frames-per-cycle N]\n"
+        "             [--frames-cap PATH] [--frames-per-cycle N] [--abort-mirror]\n"
         "                                N mirror SETUP/video-frames/TEARDOWN cycles (default 8)\n"
         "                                --no-teardown: last cycle sends no TEARDOWN/feedback\n"
         "                                (vanished-client / implicit-disconnect repro); --idle-s\n"
@@ -1176,6 +1184,8 @@ void print_usage(const char *argv0) {
         "                                --frames-cap: a -capture-format .cap fixture to source\n"
         "                                real SPS/PPS + a genuine varying frame sequence from\n"
         "                                (default tools/captures/trimmed/personalmac-stall-20260911-10s.cap)\n"
+        "                                --abort-mirror: close each cycle's mirror data socket with\n"
+        "                                RST, not FIN (ECONNRESET / conn_reset reason 1 path)\n"
         "                                --frames-per-cycle: real frames sent per cycle at ~30fps\n"
         "                                spacing, wrapping if it exceeds the fixture's own frame\n"
         "                                count (default 90, ~3s; 0 = the fixture's full length)\n"
@@ -1204,6 +1214,7 @@ int main(int argc, char *argv[]) {
     int cycles = 8;
     int gap_s = 0;
     bool no_final_teardown = false;
+    bool abort_mirror = false;
     int idle_s = 0;
     std::string frames_cap_path = "tools/captures/trimmed/personalmac-stall-20260911-10s.cap";
     int frames_per_cycle = 90;
@@ -1221,6 +1232,8 @@ int main(int argc, char *argv[]) {
             gap_s = atoi(argv[++i]);
         } else if (arg == "--no-teardown") {
             no_final_teardown = true;
+        } else if (arg == "--abort-mirror") {
+            abort_mirror = true;
         } else if (arg == "--idle-s" && i + 1 < argc) {
             idle_s = atoi(argv[++i]);
         } else if (arg == "--frames-cap" && i + 1 < argc) {
@@ -1251,7 +1264,8 @@ int main(int argc, char *argv[]) {
     }
 
     if (mode == "threadtest") return mode_threadtest(cycles, gap_s);
-    if (mode == "mirrortest") return mode_mirrortest(cycles, gap_s, no_final_teardown, idle_s, frames_cap_path, frames_per_cycle);
+    if (mode == "mirrortest") return mode_mirrortest(cycles, gap_s, no_final_teardown, idle_s, frames_cap_path,
+                                                     frames_per_cycle, abort_mirror);
     if (mode == "ntpresync") return mode_ntpresync();
     if (mode == "resendstorm") return mode_resendstorm();
     if (mode == "resendrecovery") return mode_resendrecovery();
